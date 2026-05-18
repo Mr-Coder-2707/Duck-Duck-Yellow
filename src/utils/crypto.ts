@@ -143,3 +143,61 @@ export async function decryptMessage(
 
   return new TextDecoder().decode(decrypted);
 }
+
+// Generate a visual key fingerprint (16-char code + 4 emojis)
+export async function generateKeyFingerprint(
+  secretBase64: string
+): Promise<{ text: string; emojis: string[] }> {
+  try {
+    const bytes = base64ToUint8(secretBase64);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', toArrayBuffer(bytes));
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+
+    // Alphanumeric Fingerprint: e.g., A1B2-C3D4-E5F6-7F8A
+    const hex = hashArray
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('')
+      .toUpperCase();
+    const formattedText = `${hex.slice(0, 4)}-${hex.slice(4, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}`;
+
+    // Beautiful emojis to visually check matching fingerprint easily
+    const emojiList = [
+      '🦆', '🟡', '🔒', '🗝️', '🛡️', '💻', '🦊', '🚀', 
+      '🌟', '💎', '🔥', '🌈', '🍕', '🎯', '🎸', '🎨', 
+      '✈️', '🏝️', '🎈', '🎉', '🧸', '🔋', '🔮', '🍀', 
+      '💡', '🔔', '🪐', '🦄', '🐳', '🥑', '🥨', '🍪'
+    ];
+    const emojis = [
+      emojiList[hashArray[0] % emojiList.length],
+      emojiList[hashArray[1] % emojiList.length],
+      emojiList[hashArray[2] % emojiList.length],
+      emojiList[hashArray[3] % emojiList.length]
+    ];
+
+    return { text: formattedText, emojis };
+  } catch {
+    return { text: 'ERROR', emojis: ['❌'] };
+  }
+}
+
+// Derive dynamic PFS session key from base secret and dynamic peer salts
+export async function derivePfsKey(
+  baseSecretBase64: string,
+  saltABase64: string,
+  saltBBase64: string
+): Promise<string> {
+  const baseSecret = base64ToUint8(baseSecretBase64);
+  const saltA = base64ToUint8(saltABase64);
+  const saltB = base64ToUint8(saltBBase64);
+
+  // Combine baseSecret, saltA, saltB
+  const combined = new Uint8Array(baseSecret.length + saltA.length + saltB.length);
+  combined.set(baseSecret, 0);
+  combined.set(saltA, baseSecret.length);
+  combined.set(saltB, baseSecret.length + saltA.length);
+
+  // Hash the combination to derive a strong 32-byte dynamic session key
+  const derivedBuffer = await crypto.subtle.digest('SHA-256', toArrayBuffer(combined));
+  return bytesToBase64(new Uint8Array(derivedBuffer));
+}
+

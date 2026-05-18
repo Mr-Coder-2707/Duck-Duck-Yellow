@@ -6,6 +6,8 @@ import {
   parseYellowCode,
   encryptMessage,
   decryptMessage,
+  generateKeyFingerprint,
+  derivePfsKey,
 } from './utils/crypto';
 import logoImg from './image/logo.png';
 
@@ -39,10 +41,23 @@ interface ChatMsg {
     senderName: string;
   };
   stickerId?: string;
+  file?: {
+    name: string;
+    type: string;
+    data: string; // Decrypted base64 data URL
+    size: number;
+  };
+  audio?: {
+    data: string; // Decrypted base64 data URL
+    duration: number;
+  };
+  expiresIn?: number; // ms duration for self-destruct
+  expiresAt?: number; // local timestamp when it should self-destruct
+  read?: boolean;
 }
 
 interface BCEvent {
-  type: 'message' | 'join' | 'leave' | 'typing' | 'reaction';
+  type: 'message' | 'join' | 'leave' | 'typing' | 'reaction' | 'salt' | 'read';
   senderDuckId: string;
   senderName: string;
   payload?: string;
@@ -97,6 +112,49 @@ function fmtTime(ts: number) {
 }
 function copyText(text: string) {
   navigator.clipboard.writeText(text).catch(() => {});
+}
+
+function playQuack() {
+  try {
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const osc1 = ctx.createOscillator();
+    const osc2 = ctx.createOscillator();
+    const gain = ctx.createGain();
+    
+    osc1.type = 'triangle';
+    osc1.frequency.setValueAtTime(320, ctx.currentTime);
+    osc1.frequency.exponentialRampToValueAtTime(160, ctx.currentTime + 0.16);
+    
+    osc2.type = 'sawtooth';
+    osc2.frequency.setValueAtTime(330, ctx.currentTime);
+    osc2.frequency.exponentialRampToValueAtTime(170, ctx.currentTime + 0.16);
+    
+    gain.gain.setValueAtTime(0.08, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.16);
+    
+    osc1.connect(gain);
+    osc2.connect(gain);
+    gain.connect(ctx.destination);
+    
+    osc1.start();
+    osc2.start();
+    osc1.stop(ctx.currentTime + 0.16);
+    osc2.stop(ctx.currentTime + 0.16);
+  } catch {
+    // Ignore audio context blocks
+  }
+}
+
+function fmtSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1048576).toFixed(1)} MB`;
+}
+
+function fmtDuration(secs: number) {
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
 // ======================== CUSTOM STICKERS ========================
@@ -223,6 +281,118 @@ const DuckSticker: React.FC<{ id: string; size?: number }> = ({ id, size = 90 })
   );
 };
 
+// ======================== VOICE NOTES PLAYER ========================
+
+const VoicePlayer: React.FC<{ data: string; duration: number }> = ({ data, duration }) => {
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
+
+  useEffect(() => {
+    const audio = new Audio(data);
+    audioRef.current = audio;
+
+    const handleTimeUpdate = () => {
+      setCurrentTime(audio.currentTime);
+    };
+
+    const handleEnded = () => {
+      setIsPlaying(false);
+      setCurrentTime(0);
+    };
+
+    audio.addEventListener('timeupdate', handleTimeUpdate);
+    audio.addEventListener('ended', handleEnded);
+
+    return () => {
+      audio.pause();
+      audio.removeEventListener('timeupdate', handleTimeUpdate);
+      audio.removeEventListener('ended', handleEnded);
+    };
+  }, [data]);
+
+  const togglePlay = () => {
+    if (!audioRef.current) return;
+    if (isPlaying) {
+      audioRef.current.pause();
+      setIsPlaying(false);
+    } else {
+      audioRef.current.play().catch(e => console.error("Audio playback block", e));
+      setIsPlaying(true);
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-3 p-3 bg-black/45 border border-amber-500/10 rounded-xl mt-2 w-64 select-none">
+      <button 
+        onClick={togglePlay} 
+        className="w-9 h-9 rounded-full bg-amber-500 text-gray-900 flex items-center justify-center hover:scale-105 active:scale-95 transition-all shrink-0"
+      >
+        <span className="material-symbols-rounded text-xl">
+          {isPlaying ? 'pause' : 'play_arrow'}
+        </span>
+      </button>
+      <div className="flex-1 min-w-0">
+        <div className="h-1 bg-gray-800 rounded-full overflow-hidden relative cursor-pointer" onClick={(e) => {
+          if (!audioRef.current || duration === 0) return;
+          const rect = e.currentTarget.getBoundingClientRect();
+          const clickX = e.clientX - rect.left;
+          const percent = clickX / rect.width;
+          audioRef.current.currentTime = percent * duration;
+        }}>
+          <div className="h-full bg-amber-500 transition-all duration-75" style={{ width: `${progress}%` }} />
+        </div>
+        <div className="flex justify-between text-[9px] text-gray-500 mt-1.5 font-mono">
+          <span>{fmtDuration(currentTime)}</span>
+          <span>{fmtDuration(duration)}</span>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ======================== EPHEMERAL TIMER COUNTDOWN ========================
+
+const SelfDestructTimer: React.FC<{ timestamp: number; expiresIn: number; onExpire: () => void }> = ({ timestamp, expiresIn, onExpire }) => {
+  const [timeLeft, setTimeLeft] = useState(() => {
+    const elapsed = Date.now() - timestamp;
+    return Math.max(0, expiresIn - elapsed);
+  });
+
+  useEffect(() => {
+    if (timeLeft <= 0) {
+      onExpire();
+      return;
+    }
+
+    const timer = setInterval(() => {
+      const elapsed = Date.now() - timestamp;
+      const remaining = Math.max(0, expiresIn - elapsed);
+      setTimeLeft(remaining);
+      if (remaining <= 0) {
+        clearInterval(timer);
+        onExpire();
+      }
+    }, 100);
+
+    return () => clearInterval(timer);
+  }, [timestamp, expiresIn, onExpire, timeLeft]);
+
+  const percent = (timeLeft / expiresIn) * 100;
+  const secs = Math.ceil(timeLeft / 1000);
+
+  return (
+    <div className="mt-1.5 flex items-center gap-2 bg-red-500/10 border border-red-500/20 px-2 py-1 rounded-lg text-[9px] font-bold text-red-400 select-none w-fit">
+      <span className="material-symbols-rounded text-xs animate-spin" style={{ animationDuration: '3s' }}>hourglass_empty</span>
+      <span>Self-destructs in {secs}s</span>
+      <div className="w-12 h-1 bg-gray-800 rounded-full overflow-hidden shrink-0">
+        <div className="h-full bg-red-500 transition-all" style={{ width: `${percent}%` }} />
+      </div>
+    </div>
+  );
+};
+
 // ======================== APP ========================
 
 export default function App() {
@@ -251,6 +421,7 @@ export default function App() {
   const [chatInput, setChatInput] = useState('');
   const [peerOnline, setPeerOnline] = useState(false);
   const [peerName, setPeerName] = useState('');
+  const [peerDuckId, setPeerDuckId] = useState<string | null>(null);
   const [showCodeBanner, setShowCodeBanner] = useState(true);
   const [isCreator, setIsCreator] = useState(false);
 
@@ -265,6 +436,47 @@ export default function App() {
   const peerTypingTimeoutRef = useRef<any>(null);
   const localTypingTimeoutRef = useRef<any>(null);
   const isLocalTypingRef = useRef(false);
+
+  // ---- New Feature States & Refs ----
+  // 1. Local Contact Book
+  const [contacts, setContacts] = useState<{ duckId: string; alias: string }[]>([]);
+  const [dashTab, setDashTab] = useState<'actions' | 'contacts'>('actions');
+  const [newContactAlias, setNewContactAlias] = useState('');
+  const [newContactDuckId, setNewContactDuckId] = useState('');
+
+  // 2. PFS & Verification Fingerprint
+  const [localSalt] = useState(() => {
+    const bytes = window.crypto.getRandomValues(new Uint8Array(16));
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  });
+  const [peerSalt, setPeerSalt] = useState<string | null>(null);
+  const [pfsActive, setPfsActive] = useState(false);
+  const [fingerprint, setFingerprint] = useState<{ text: string; emojis: string[] } | null>(null);
+
+  // 3. Ephemeral Messages
+  const [ephemeralTimer, setEphemeralTimer] = useState<number>(0); // 0 means off, otherwise ms duration
+
+  // 4. File Attachment
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // 5. Voice Notes
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingDuration, setRecordingDuration] = useState(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingTimerRef = useRef<any>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+
+  // 6. In-Chat Search
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+
+  // 7. Read Receipts Tracking
+  const unreadMessagesRef = useRef<string[]>([]);
+  const isWindowFocused = useRef(true);
 
   // ---- Refs ----
   interface NtfyChannel {
@@ -402,12 +614,40 @@ export default function App() {
     setPeerTyping(false); // Reset peer typing state on new room join
     setShowCodeBanner(creator);
     setIsCreator(creator);
+    setPeerSalt(null);
+    setPfsActive(false);
+    setEphemeralTimer(0);
     setView('chat');
 
-    // Send initial join message
+    // Calculate fingerprint for initial base key
+    generateKeyFingerprint(secret).then(fp => {
+      setFingerprint(fp);
+    });
+
+    // Dynamic PFS salt transmission
+    const sendSalt = async (targetSecret: string) => {
+      const u = userRef.current;
+      if (u) {
+        try {
+          const encSalt = await encryptMessage(localSalt, targetSecret);
+          postMessage({
+            type: 'salt',
+            senderDuckId: u.duckId,
+            senderName: u.username,
+            payload: encSalt,
+            timestamp: Date.now()
+          });
+        } catch (e) {
+          console.error("Failed to send salt:", e);
+        }
+      }
+    };
+
+    // Send initial join message and our local salt immediately
     const u = userRef.current;
     if (u) {
       postMessage({ type: 'join', senderDuckId: u.duckId, senderName: u.username, timestamp: Date.now() } satisfies BCEvent);
+      sendSalt(secret);
     }
 
     // Keep track of our current peerOnline state using a local variable so we can safely inspect it inside the async callback
@@ -432,11 +672,37 @@ export default function App() {
           setPeerOnline(true);
           currentPeerOnline = true;
           setPeerName(d.senderName);
+          setPeerDuckId(d.senderDuckId);
           setShowCodeBanner(false);
+
+          // Symmetrical salt exchange: re-send our salt to the newly online peer
+          sendSalt(secret);
 
           // We always send a join event when first connecting, whether they sent a join or any other event,
           // so that the peer also sets their peerOnline to true.
           postMessage({ type: 'join', senderDuckId: me.duckId, senderName: me.username, timestamp: Date.now() } satisfies BCEvent);
+        }
+
+        if (d.type === 'salt' && d.payload) {
+          try {
+            // Decrypt salt using base secret
+            const decryptedSalt = await decryptMessage(d.payload, secret);
+            setPeerSalt(decryptedSalt);
+
+            // Sort salts lexicographically to ensure identical key derivation order on both sides
+            const salts = [localSalt, decryptedSalt].sort();
+            const derivedKey = await derivePfsKey(secret, salts[0], salts[1]);
+
+            // Swap session key
+            secretRef.current = derivedKey;
+            setPfsActive(true);
+
+            // Generate verified fingerprint
+            const fp = await generateKeyFingerprint(derivedKey);
+            setFingerprint(fp);
+          } catch (e) {
+            console.error('PFS derivation failed:', e);
+          }
         }
 
         if (d.type === 'message' && d.payload) {
@@ -446,17 +712,21 @@ export default function App() {
             let decryptedText = txt;
             let replyToData = undefined;
             let stickerIdData = undefined;
+            let fileData = undefined;
+            let audioData = undefined;
+            let expiresInVal = undefined;
             try {
               const parsed = JSON.parse(txt);
               if (parsed) {
                 if (parsed.id) {
                   messageId = parsed.id;
                 }
-                if (typeof parsed.text === 'string' || parsed.stickerId) {
-                  decryptedText = parsed.text || '';
-                  replyToData = parsed.replyTo;
-                  stickerIdData = parsed.stickerId;
-                }
+                decryptedText = parsed.text || '';
+                replyToData = parsed.replyTo;
+                stickerIdData = parsed.stickerId;
+                fileData = parsed.file;
+                audioData = parsed.audio;
+                expiresInVal = parsed.expiresIn;
               }
             } catch {
               // Legacy plain text message
@@ -470,7 +740,10 @@ export default function App() {
                 timestamp: d.timestamp,
                 senderName: d.senderName,
                 replyTo: replyToData,
-                stickerId: stickerIdData
+                stickerId: stickerIdData,
+                file: fileData,
+                audio: audioData,
+                expiresIn: expiresInVal
               }];
               sessionStorage.setItem('ddy_chat_messages', JSON.stringify(updated));
               return updated;
@@ -479,6 +752,39 @@ export default function App() {
             setPeerTyping(false);
             if (peerTypingTimeoutRef.current) {
               clearTimeout(peerTypingTimeoutRef.current);
+            }
+
+            // Play quack notification sound!
+            playQuack();
+
+            // Background notifications
+            if (document.hidden && Notification.permission === 'granted') {
+              try {
+                let notifBody = decryptedText;
+                if (fileData) notifBody = `📁 sent a file: ${fileData.name}`;
+                else if (audioData) notifBody = `🎤 sent a voice note (${fmtDuration(audioData.duration)})`;
+                else if (stickerIdData) notifBody = `🦆 sent a duck sticker`;
+
+                new Notification(`🦆 Duck Duck Yellow`, {
+                  body: `${d.senderName}: ${notifBody}`,
+                  icon: logoImg
+                });
+              } catch (e) {
+                console.error('Failed to show notification:', e);
+              }
+            }
+
+            // Send read receipt if window is focused, else queue it
+            if (isWindowFocused.current) {
+              postMessage({
+                type: 'read',
+                senderDuckId: me.duckId,
+                senderName: me.username,
+                payload: messageId,
+                timestamp: Date.now()
+              });
+            } else {
+              unreadMessagesRef.current.push(messageId);
             }
           } catch (e) {
             console.error('Decryption failed:', e);
@@ -519,6 +825,19 @@ export default function App() {
             console.error('Failed to handle reaction event:', e);
           }
         }
+        if (d.type === 'read' && d.payload) {
+          const readMsgId = d.payload;
+          setMessages(prev => {
+            const updated = prev.map(m => {
+              if (m.isMine && (m.id === readMsgId || m.timestamp <= d.timestamp)) {
+                return { ...m, read: true };
+              }
+              return m;
+            });
+            sessionStorage.setItem('ddy_chat_messages', JSON.stringify(updated));
+            return updated;
+          });
+        }
         if (d.type === 'typing') {
           const isTyping = d.payload === 'true';
           setPeerTyping(isTyping);
@@ -550,7 +869,7 @@ export default function App() {
       console.error('EventSource error:', err);
     };
 
-  }, []);
+  }, [localSalt]);
 
   const toggleReaction = useCallback(async (messageId: string, emoji: string) => {
     if (!channelRef.current || !userRef.current || !peerOnline) return;
@@ -620,7 +939,8 @@ export default function App() {
       id: messageId,
       text: "",
       stickerId,
-      replyTo: replyToData
+      replyTo: replyToData,
+      expiresIn: ephemeralTimer > 0 ? ephemeralTimer : undefined
     };
 
     const enc = await encryptMessage(JSON.stringify(payloadObj), secretRef.current);
@@ -642,7 +962,8 @@ export default function App() {
         isMine: true,
         timestamp: Date.now(),
         senderName: u.username,
-        replyTo: replyToData
+        replyTo: replyToData,
+        expiresIn: ephemeralTimer > 0 ? ephemeralTimer : undefined
       }];
       sessionStorage.setItem('ddy_chat_messages', JSON.stringify(updated));
       return updated;
@@ -650,7 +971,7 @@ export default function App() {
 
     setReplyingTo(null);
     setShowStickerPicker(false);
-  }, [peerOnline, replyingTo]);
+  }, [peerOnline, replyingTo, ephemeralTimer]);
 
   const sendMessage = useCallback(async () => {
     const text = chatInput.trim();
@@ -681,7 +1002,8 @@ export default function App() {
     const payloadObj = {
       id: messageId,
       text,
-      replyTo: replyToData
+      replyTo: replyToData,
+      expiresIn: ephemeralTimer > 0 ? ephemeralTimer : undefined
     };
 
     const enc = await encryptMessage(JSON.stringify(payloadObj), secretRef.current);
@@ -702,14 +1024,210 @@ export default function App() {
         isMine: true,
         timestamp: Date.now(),
         senderName: u.username,
-        replyTo: replyToData
+        replyTo: replyToData,
+        expiresIn: ephemeralTimer > 0 ? ephemeralTimer : undefined
       }];
       sessionStorage.setItem('ddy_chat_messages', JSON.stringify(updated));
       return updated;
     });
 
     setReplyingTo(null); // Clear the active reply quote
-  }, [chatInput, replyingTo]);
+  }, [chatInput, replyingTo, ephemeralTimer]);
+
+  const sendFileMessage = useCallback(async (file: File) => {
+    const channel = channelRef.current;
+    const u = userRef.current;
+    if (!channel || !u || !peerOnline) return;
+    if (file.size > 1500000) {
+      alert("الملف كبير جداً! الحد الأقصى المسموح به هو 1.5 ميجابايت.");
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const arrayBuffer = reader.result as ArrayBuffer;
+        const bytes = new Uint8Array(arrayBuffer);
+        
+        let binary = '';
+        const len = bytes.byteLength;
+        for (let i = 0; i < len; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        const base64Data = `data:${file.type};base64,${btoa(binary)}`;
+
+        const replyToData = replyingTo ? {
+          id: replyingTo.id,
+          text: replyingTo.text,
+          senderName: replyingTo.senderName
+        } : undefined;
+
+        const messageId = genId();
+        const payloadObj = {
+          id: messageId,
+          text: "",
+          file: {
+            name: file.name,
+            type: file.type,
+            data: base64Data,
+            size: file.size
+          },
+          replyTo: replyToData,
+          expiresIn: ephemeralTimer > 0 ? ephemeralTimer : undefined
+        };
+
+        const enc = await encryptMessage(JSON.stringify(payloadObj), secretRef.current);
+
+        channel.postMessage({
+          type: 'message',
+          senderDuckId: u.duckId,
+          senderName: u.username,
+          payload: enc,
+          timestamp: Date.now()
+        } satisfies BCEvent);
+
+        setMessages(p => {
+          const updated = [...p, {
+            id: messageId,
+            text: "",
+            file: {
+              name: file.name,
+              type: file.type,
+              data: base64Data,
+              size: file.size
+            },
+            isMine: true,
+            timestamp: Date.now(),
+            senderName: u.username,
+            replyTo: replyToData,
+            expiresIn: ephemeralTimer > 0 ? ephemeralTimer : undefined
+          }];
+          sessionStorage.setItem('ddy_chat_messages', JSON.stringify(updated));
+          return updated;
+        });
+
+        setReplyingTo(null);
+      } catch (err) {
+        console.error("Failed to encrypt and send file:", err);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }, [peerOnline, replyingTo, ephemeralTimer]);
+
+  const sendAudioMessage = async (base64Data: string, duration: number) => {
+    if (!channelRef.current || !userRef.current || !peerOnline) return;
+
+    const replyToData = replyingTo ? {
+      id: replyingTo.id,
+      text: replyingTo.text,
+      senderName: replyingTo.senderName
+    } : undefined;
+
+    const messageId = genId();
+    const payloadObj = {
+      id: messageId,
+      text: "",
+      audio: {
+        data: base64Data,
+        duration: duration
+      },
+      replyTo: replyToData,
+      expiresIn: ephemeralTimer > 0 ? ephemeralTimer : undefined
+    };
+
+    const enc = await encryptMessage(JSON.stringify(payloadObj), secretRef.current);
+    const u = userRef.current;
+
+    channelRef.current.postMessage({
+      type: 'message',
+      senderDuckId: u.duckId,
+      senderName: u.username,
+      payload: enc,
+      timestamp: Date.now()
+    } satisfies BCEvent);
+
+    setMessages(p => {
+      const updated = [...p, {
+        id: messageId,
+        text: "",
+        audio: {
+          data: base64Data,
+          duration: duration
+        },
+        isMine: true,
+        timestamp: Date.now(),
+        senderName: u.username,
+        replyTo: replyToData,
+        expiresIn: ephemeralTimer > 0 ? ephemeralTimer : undefined
+      }];
+      sessionStorage.setItem('ddy_chat_messages', JSON.stringify(updated));
+      return updated;
+    });
+
+    setReplyingTo(null);
+  };
+
+  const startRecording = async () => {
+    if (!peerOnline) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioChunksRef.current = [];
+      const options = MediaRecorder.isTypeSupported('audio/webm') ? { mimeType: 'audio/webm' } : undefined;
+      const mediaRecorder = new MediaRecorder(stream, options);
+      
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          audioChunksRef.current.push(e.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: mediaRecorder.mimeType || 'audio/webm' });
+        stream.getTracks().forEach(track => track.stop());
+
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+          try {
+            const base64Data = reader.result as string;
+            await sendAudioMessage(base64Data, recordingDuration);
+          } catch (e) {
+            console.error("Failed to send audio:", e);
+          }
+        };
+        reader.readAsDataURL(audioBlob);
+      };
+
+      mediaRecorderRef.current = mediaRecorder;
+      mediaRecorder.start();
+      setIsRecording(true);
+      setRecordingDuration(0);
+
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingDuration(d => d + 1);
+      }, 1000);
+
+    } catch (err) {
+      console.error("Microphone access denied or error:", err);
+      alert("لا يمكن الوصول للميكروفون. يرجى التحقق من أذونات المتصفح.");
+    }
+  };
+
+  const stopRecording = (cancel: boolean = false) => {
+    if (!mediaRecorderRef.current || !isRecording) return;
+    
+    clearInterval(recordingTimerRef.current);
+    setIsRecording(false);
+    
+    if (cancel) {
+      mediaRecorderRef.current.onstop = null;
+      mediaRecorderRef.current.stop();
+      if (mediaRecorderRef.current.stream) {
+        mediaRecorderRef.current.stream.getTracks().forEach(t => t.stop());
+      }
+    } else {
+      mediaRecorderRef.current.stop();
+    }
+  };
 
   const leaveChat = useCallback(() => {
     if (channelRef.current) {
@@ -729,12 +1247,25 @@ export default function App() {
     setMessages([]);
     setPeerOnline(false);
     setPeerName('');
+    setPeerDuckId(null);
     setPeerTyping(false);
+    setPeerSalt(null);
+    setPfsActive(false);
+    setFingerprint(null);
+    setEphemeralTimer(0);
     if (peerTypingTimeoutRef.current) clearTimeout(peerTypingTimeoutRef.current);
     if (localTypingTimeoutRef.current) clearTimeout(localTypingTimeoutRef.current);
     isLocalTypingRef.current = false;
     setYellowCode('');
     setView('dashboard');
+  }, []);
+
+  const purgeMessage = useCallback((id: string) => {
+    setMessages(prev => {
+      const updated = prev.filter(m => m.id !== id);
+      sessionStorage.setItem('ddy_chat_messages', JSON.stringify(updated));
+      return updated;
+    });
   }, []);
 
   const handleCreateChat = () => {
@@ -772,6 +1303,79 @@ export default function App() {
       setView('dashboard');
     }
   }, [joinRoom]);
+
+  // ---- Load/Save Local Contacts ----
+  useEffect(() => {
+    if (user) {
+      try {
+        const stored = localStorage.getItem(`ddy_contacts_${user.duckId}`);
+        if (stored) {
+          setContacts(JSON.parse(stored));
+        } else {
+          setContacts([]);
+        }
+      } catch {
+        setContacts([]);
+      }
+    } else {
+      setContacts([]);
+    }
+  }, [user]);
+
+  const saveContactsList = (newList: { duckId: string; alias: string }[]) => {
+    if (!user) return;
+    setContacts(newList);
+    localStorage.setItem(`ddy_contacts_${user.duckId}`, JSON.stringify(newList));
+  };
+
+  const handleAddContact = (duckId: string, alias: string) => {
+    if (!duckId.trim() || !alias.trim()) return;
+    const cleanId = duckId.trim().toUpperCase();
+    const cleanAlias = alias.trim();
+    if (contacts.some(c => c.duckId === cleanId)) {
+      return;
+    }
+    const newList = [...contacts, { duckId: cleanId, alias: cleanAlias }];
+    saveContactsList(newList);
+    setNewContactAlias('');
+    setNewContactDuckId('');
+  };
+
+  const handleDeleteContact = (duckId: string) => {
+    const newList = contacts.filter(c => c.duckId !== duckId);
+    saveContactsList(newList);
+  };
+
+  // ---- Window Focus and Read Receipts Sync ----
+  useEffect(() => {
+    const handleFocus = () => {
+      isWindowFocused.current = true;
+      if (unreadMessagesRef.current.length > 0 && channelRef.current && userRef.current) {
+        unreadMessagesRef.current.forEach(msgId => {
+          channelRef.current?.postMessage({
+            type: 'read',
+            senderDuckId: userRef.current!.duckId,
+            senderName: userRef.current!.username,
+            payload: msgId,
+            timestamp: Date.now()
+          });
+        });
+        unreadMessagesRef.current = [];
+      }
+    };
+
+    const handleBlur = () => {
+      isWindowFocused.current = false;
+    };
+
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('blur', handleBlur);
+
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, []);
 
   const hoverTimeoutRef = useRef<any>(null);
 
@@ -1086,128 +1690,255 @@ export default function App() {
             </button>
           </div>
 
-          {/* Two action cards */}
-          <div className="grid md:grid-cols-2 gap-6 mb-8">
-            {/* Create Chat */}
-            <div className="p-6 rounded-2xl bg-gray-900/60 border border-gray-800/60 hover:border-amber-500/20 transition-all" style={{ animation: 'slideUp 0.6s ease-out' }}>
-              <div className="flex items-center gap-3 mb-4">
-                <div className="w-10 h-10 rounded-xl bg-amber-500/10 flex items-center justify-center">
-                  <span className="material-symbols-rounded text-amber-400">vpn_key</span>
-                </div>
-                <div>
-                  <h3 className="font-bold text-white">Start New Chat</h3>
-                  <p className="text-[11px] text-gray-500">Generate a fresh Yellow Code</p>
-                </div>
-              </div>
-              <p className="text-xs text-gray-500 mb-4 leading-relaxed">
-                Each chat uses a brand-new encryption key. Share the Yellow Code via paper, a different app, or any out-of-band method.
-              </p>
-              <button
-                onClick={handleCreateChat}
-                className="w-full py-3 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-500 text-gray-900 font-bold text-sm hover:shadow-lg hover:shadow-amber-500/25 active:scale-[0.98] transition-all flex items-center justify-center gap-2"
-              >
-                <span className="material-symbols-rounded text-lg">add_circle</span>
-                Generate Yellow Code
-              </button>
-            </div>
+          {/* Tab Selector */}
+          <div className="flex gap-4 mb-6 border-b border-gray-800/60 pb-1 select-none">
+            <button
+              onClick={() => setDashTab('actions')}
+              className={`pb-2 text-sm font-semibold border-b-2 transition-all flex items-center gap-2 ${
+                dashTab === 'actions'
+                  ? 'border-amber-500 text-amber-400'
+                  : 'border-transparent text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              <span className="material-symbols-rounded text-base">forum</span>
+              Secure Conversations
+            </button>
+            <button
+              onClick={() => setDashTab('contacts')}
+              className={`pb-2 text-sm font-semibold border-b-2 transition-all flex items-center gap-2 ${
+                dashTab === 'contacts'
+                  ? 'border-amber-500 text-amber-400'
+                  : 'border-transparent text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              <span className="material-symbols-rounded text-base">contacts</span>
+              Secure Contacts Book
+            </button>
+          </div>
 
-            {/* Join Chat */}
-            <div className="p-6 rounded-2xl bg-gray-900/60 border border-gray-800/60 hover:border-emerald-500/20 transition-all" style={{ animation: 'slideUp 0.7s ease-out' }}>
-              <div className="flex items-center gap-3 mb-4">
-                <div className="w-10 h-10 rounded-xl bg-emerald-500/10 flex items-center justify-center">
-                  <span className="material-symbols-rounded text-emerald-400">chat</span>
+          {dashTab === 'contacts' ? (
+            <div className="space-y-6 animate-slide-up" style={{ animation: 'slideUp 0.3s ease-out' }}>
+              {/* Add Contact Card */}
+              <div className="p-6 rounded-2xl bg-gray-900/60 border border-gray-800/60 shadow-xl">
+                <h3 className="font-bold text-white mb-4 flex items-center gap-2 text-sm">
+                  <span className="material-symbols-rounded text-amber-400">person_add</span>
+                  Add Secure Contact
+                </h3>
+                <div className="grid sm:grid-cols-2 gap-4 mb-4">
+                  <div>
+                    <label className="text-[10px] font-medium text-gray-500 mb-1.5 block">Contact Name / Alias</label>
+                    <input
+                      value={newContactAlias}
+                      onChange={e => setNewContactAlias(e.target.value)}
+                      placeholder="e.g. Captain Duck"
+                      className="w-full bg-gray-850 border border-gray-700/60 rounded-xl px-4 py-2.5 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-amber-500/50 focus:ring-1 focus:ring-amber-500/20 transition-all"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-medium text-gray-500 mb-1.5 block">Duck ID</label>
+                    <input
+                      value={newContactDuckId}
+                      onChange={e => setNewContactDuckId(e.target.value)}
+                      placeholder="DD-XXXX-XXXX"
+                      className="w-full bg-gray-850 border border-gray-700/60 rounded-xl px-4 py-2.5 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-amber-500/50 focus:ring-1 focus:ring-amber-500/20 transition-all font-mono uppercase tracking-wider"
+                    />
+                  </div>
                 </div>
-                <div>
-                  <h3 className="font-bold text-white">Join a Chat</h3>
-                  <p className="text-[11px] text-gray-500">Enter a Yellow Code to connect</p>
-                </div>
-              </div>
-              <div className="space-y-3">
-                <input
-                  value={joinCode}
-                  onChange={e => { setJoinCode(e.target.value); setJoinError(''); }}
-                  onKeyDown={e => e.key === 'Enter' && handleJoinChat()}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/20 transition-all font-mono text-xs"
-                  placeholder="Paste Yellow Code here..."
-                />
-                {joinError && (
-                  <p className="text-red-400 text-xs flex items-center gap-1">
-                    <span className="material-symbols-rounded text-sm">error</span>
-                    {joinError}
-                  </p>
-                )}
                 <button
-                  onClick={handleJoinChat}
-                  disabled={!joinCode.trim()}
-                  className="w-full py-3 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-500 text-white font-bold text-sm disabled:opacity-30 disabled:cursor-not-allowed hover:shadow-lg hover:shadow-emerald-500/25 active:scale-[0.98] transition-all flex items-center justify-center gap-2"
+                  onClick={() => handleAddContact(newContactDuckId, newContactAlias)}
+                  disabled={!newContactAlias.trim() || !newContactDuckId.trim()}
+                  className="w-full py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-500 text-gray-900 font-bold text-xs hover:shadow-lg hover:shadow-amber-500/25 active:scale-[0.98] transition-all disabled:opacity-20 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
                 >
-                  <span className="material-symbols-rounded text-lg">login</span>
-                  Join Chat
+                  <span className="material-symbols-rounded text-sm font-bold">add</span>
+                  Save Contact Locally
                 </button>
               </div>
-            </div>
-          </div>
 
-          {/* How it works */}
-          <div className="p-6 rounded-2xl bg-gray-900/40 border border-gray-800/40" style={{ animation: 'slideUp 0.8s ease-out' }}>
-            <h3 className="font-bold text-amber-400/80 mb-4 flex items-center gap-2 text-sm">
-              <span className="material-symbols-rounded text-base">psychology</span>
-              How Duck Duck Yellow Works
-            </h3>
-            <div className="grid sm:grid-cols-2 gap-4 text-xs text-gray-500">
-              <div className="flex gap-3">
-                <span className="material-symbols-rounded text-lg text-amber-400/60 shrink-0">looks_one</span>
-                <div>
-                  <p className="text-gray-300 font-medium mb-0.5">Generate a Yellow Code</p>
-                  <p>Creates a one-time encryption key for a new chat session.</p>
-                </div>
-              </div>
-              <div className="flex gap-3">
-                <span className="material-symbols-rounded text-lg text-amber-400/60 shrink-0">looks_two</span>
-                <div>
-                  <p className="text-gray-300 font-medium mb-0.5">Share It Out-of-Band</p>
-                  <p>Write it on paper, send via email, or say it in person — anything untracked.</p>
-                </div>
-              </div>
-              <div className="flex gap-3">
-                <span className="material-symbols-rounded text-lg text-amber-400/60 shrink-0">looks_3</span>
-                <div>
-                  <p className="text-gray-300 font-medium mb-0.5">Chat with E2E Encryption</p>
-                  <p>All messages are encrypted with AES-256-GCM. Nobody in the middle can read them.</p>
-                </div>
-              </div>
-              <div className="flex gap-3">
-                <span className="material-symbols-rounded text-lg text-amber-400/60 shrink-0">looks_4</span>
-                <div>
-                  <p className="text-gray-300 font-medium mb-0.5">Leave No Trace</p>
-                  <p>When you close the chat, everything is gone. No history, no logs, no traces.</p>
-                </div>
+              {/* Contacts List Card */}
+              <div className="p-6 rounded-2xl bg-gray-900/60 border border-gray-800/60 shadow-xl">
+                <h3 className="font-bold text-white mb-4 flex items-center gap-2 text-sm select-none">
+                  <span className="material-symbols-rounded text-amber-400">group</span>
+                  Your Saved Contacts ({contacts.length})
+                </h3>
+                {contacts.length === 0 ? (
+                  <div className="text-center py-10 text-gray-500">
+                    <span className="material-symbols-rounded text-3xl text-gray-600 mb-2">contacts_product</span>
+                    <p className="text-xs">No contacts saved yet.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {contacts.map(c => (
+                      <div key={c.duckId} className="flex items-center justify-between p-3 bg-black/30 border border-gray-800/60 hover:border-gray-700/60 rounded-xl transition-all">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 rounded-full bg-amber-500/10 border border-amber-500/20 flex items-center justify-center font-bold text-amber-400 text-sm select-none">
+                            {c.alias.charAt(0).toUpperCase()}
+                          </div>
+                          <div>
+                            <p className="text-sm font-semibold text-gray-200">{c.alias}</p>
+                            <p className="text-[10px] text-gray-500 font-mono mt-0.5 tracking-wider">{c.duckId}</p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => { copyText(c.duckId); }}
+                            className="w-8 h-8 rounded-lg bg-gray-800 hover:bg-gray-700 flex items-center justify-center text-gray-400 hover:text-white transition-all shrink-0"
+                            title="Copy Duck ID"
+                          >
+                            <span className="material-symbols-rounded text-base">content_copy</span>
+                          </button>
+                          <button
+                            onClick={() => {
+                              const { code, roomId, secret } = generateYellowCode();
+                              setYellowCode(code);
+                              setCopiedCode(false);
+                              joinRoom(roomId, secret, true);
+                            }}
+                            className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-900 text-xs font-bold transition-all shrink-0 flex items-center gap-1"
+                            title="Start encrypted conversation"
+                          >
+                            <span className="material-symbols-rounded text-sm">chat_bubble</span>
+                            Chat
+                          </button>
+                          <button
+                            onClick={() => handleDeleteContact(c.duckId)}
+                            className="w-8 h-8 rounded-lg bg-red-500/10 hover:bg-red-500/20 border border-red-500/10 hover:border-red-500/20 flex items-center justify-center text-red-400 transition-all shrink-0"
+                            title="Delete Contact"
+                          >
+                            <span className="material-symbols-rounded text-base">delete</span>
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
-            <div className="mt-4 pt-4 border-t border-gray-800/40 flex flex-wrap gap-x-4 gap-y-2 text-[11px] text-gray-600">
-              <span className="flex items-center gap-1">
-                <span className="material-symbols-rounded text-xs text-amber-400/40">lock</span>
-                AES-256-GCM Encryption
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="material-symbols-rounded text-xs text-amber-400/40">database_off</span>
-                Zero Message Storage
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="material-symbols-rounded text-xs text-amber-400/40">vpn_key</span>
-                One-Time Keys Per Chat
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="material-symbols-rounded text-xs text-amber-400/40">visibility_off</span>
-                No Tracking Whatsoever
-              </span>
-            </div>
-          </div>
+          ) : (
+            <>
+              {/* Two action cards */}
+              <div className="grid md:grid-cols-2 gap-6 mb-8">
+                {/* Create Chat */}
+                <div className="p-6 rounded-2xl bg-gray-900/60 border border-gray-800/60 hover:border-amber-500/20 transition-all" style={{ animation: 'slideUp 0.6s ease-out' }}>
+                  <div className="flex items-center gap-3 mb-4">
+                    <div className="w-10 h-10 rounded-xl bg-amber-500/10 flex items-center justify-center">
+                      <span className="material-symbols-rounded text-amber-400">vpn_key</span>
+                    </div>
+                    <div>
+                      <h3 className="font-bold text-white">Start New Chat</h3>
+                      <p className="text-[11px] text-gray-500">Generate a fresh Yellow Code</p>
+                    </div>
+                  </div>
+                  <p className="text-xs text-gray-500 mb-4 leading-relaxed">
+                    Each chat uses a brand-new encryption key. Share the Yellow Code via paper, a different app, or any out-of-band method.
+                  </p>
+                  <button
+                    onClick={handleCreateChat}
+                    className="w-full py-3 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-500 text-gray-900 font-bold text-sm hover:shadow-lg hover:shadow-amber-500/25 active:scale-[0.98] transition-all flex items-center justify-center gap-2"
+                  >
+                    <span className="material-symbols-rounded text-lg">add_circle</span>
+                    Generate Yellow Code
+                  </button>
+                </div>
 
-          {/* Note */}
-          <p className="text-center text-[11px] text-gray-700 mt-8">
-            Open on another device or tab to test the real-time end-to-end encrypted connection.
-          </p>
+                {/* Join Chat */}
+                <div className="p-6 rounded-2xl bg-gray-900/60 border border-gray-800/60 hover:border-emerald-500/20 transition-all" style={{ animation: 'slideUp 0.7s ease-out' }}>
+                  <div className="flex items-center gap-3 mb-4">
+                    <div className="w-10 h-10 rounded-xl bg-emerald-500/10 flex items-center justify-center">
+                      <span className="material-symbols-rounded text-emerald-400">chat</span>
+                    </div>
+                    <div>
+                      <h3 className="font-bold text-white">Join a Chat</h3>
+                      <p className="text-[11px] text-gray-500">Enter a Yellow Code to connect</p>
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    <input
+                      value={joinCode}
+                      onChange={e => { setJoinCode(e.target.value); setJoinError(''); }}
+                      onKeyDown={e => e.key === 'Enter' && handleJoinChat()}
+                      className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/20 transition-all font-mono text-xs"
+                      placeholder="Paste Yellow Code here..."
+                    />
+                    {joinError && (
+                      <p className="text-red-400 text-xs flex items-center gap-1">
+                        <span className="material-symbols-rounded text-sm">error</span>
+                        {joinError}
+                      </p>
+                    )}
+                    <button
+                      onClick={handleJoinChat}
+                      disabled={!joinCode.trim()}
+                      className="w-full py-3 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-500 text-white font-bold text-sm disabled:opacity-30 disabled:cursor-not-allowed hover:shadow-lg hover:shadow-emerald-500/25 active:scale-[0.98] transition-all flex items-center justify-center gap-2"
+                    >
+                      <span className="material-symbols-rounded text-lg">login</span>
+                      Join Chat
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* How it works */}
+              <div className="p-6 rounded-2xl bg-gray-900/40 border border-gray-800/40" style={{ animation: 'slideUp 0.8s ease-out' }}>
+                <h3 className="font-bold text-amber-400/80 mb-4 flex items-center gap-2 text-sm">
+                  <span className="material-symbols-rounded text-base">psychology</span>
+                  How Duck Duck Yellow Works
+                </h3>
+                <div className="grid sm:grid-cols-2 gap-4 text-xs text-gray-500">
+                  <div className="flex gap-3">
+                    <span className="material-symbols-rounded text-lg text-amber-400/60 shrink-0">looks_one</span>
+                    <div>
+                      <p className="text-gray-300 font-medium mb-0.5">Generate a Yellow Code</p>
+                      <p>Creates a one-time encryption key for a new chat session.</p>
+                    </div>
+                  </div>
+                  <div className="flex gap-3">
+                    <span className="material-symbols-rounded text-lg text-amber-400/60 shrink-0">looks_two</span>
+                    <div>
+                      <p className="text-gray-300 font-medium mb-0.5">Share It Out-of-Band</p>
+                      <p>Write it on paper, send via email, or say it in person — anything untracked.</p>
+                    </div>
+                  </div>
+                  <div className="flex gap-3">
+                    <span className="material-symbols-rounded text-lg text-amber-400/60 shrink-0">looks_3</span>
+                    <div>
+                      <p className="text-gray-300 font-medium mb-0.5">Chat with E2E Encryption</p>
+                      <p>All messages are encrypted with AES-256-GCM. Nobody in the middle can read them.</p>
+                    </div>
+                  </div>
+                  <div className="flex gap-3">
+                    <span className="material-symbols-rounded text-lg text-amber-400/60 shrink-0">looks_4</span>
+                    <div>
+                      <p className="text-gray-300 font-medium mb-0.5">Leave No Trace</p>
+                      <p>When you close the chat, everything is gone. No history, no logs, no traces.</p>
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-4 pt-4 border-t border-gray-800/40 flex flex-wrap gap-x-4 gap-y-2 text-[11px] text-gray-600">
+                  <span className="flex items-center gap-1">
+                    <span className="material-symbols-rounded text-xs text-amber-400/40">lock</span>
+                    AES-256-GCM Encryption
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <span className="material-symbols-rounded text-xs text-amber-400/40">database_off</span>
+                    Zero Message Storage
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <span className="material-symbols-rounded text-xs text-amber-400/40">vpn_key</span>
+                    One-Time Keys Per Chat
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <span className="material-symbols-rounded text-xs text-amber-400/40">visibility_off</span>
+                    No Tracking Whatsoever
+                  </span>
+                </div>
+              </div>
+
+              {/* Note */}
+              <p className="text-center text-[11px] text-gray-700 mt-8">
+                Open on another device or tab to test the real-time end-to-end encrypted connection.
+              </p>
+            </>
+          )}
         </main>
       </div>
     );
@@ -1222,16 +1953,16 @@ export default function App() {
 
         {/* Chat Header */}
         <header className="shrink-0 border-b border-gray-800/60 bg-gray-900/70 backdrop-blur-sm z-20">
-          <div className="max-w-3xl mx-auto px-4 py-3 flex items-center justify-between">
-            <div className="flex items-center gap-3 min-w-0">
+          <div className="max-w-3xl mx-auto px-4 py-3 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3 min-w-0 flex-1">
               <button
                 onClick={() => setShowLeaveConfirm(true)}
                 className="w-8 h-8 rounded-lg bg-gray-800/60 border border-gray-700/50 flex items-center justify-center text-gray-400 hover:text-white hover:bg-gray-700/60 transition-all shrink-0"
-                title="Leave chat"
+                title="Leave secure session"
               >
                 <span className="material-symbols-rounded text-lg">arrow_back</span>
               </button>
-              <div className="min-w-0">
+              <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <h3 className="font-bold text-white text-sm truncate">
                     {peerOnline ? peerName : (isCreator ? 'Waiting for partner...' : 'Connecting...')}
@@ -1245,10 +1976,61 @@ export default function App() {
                 </div>
                 <div className="flex items-center gap-1.5 mt-0.5">
                   <span className="material-symbols-rounded text-xs text-amber-400/60">lock</span>
-                  <span className="text-[10px] text-gray-600">End-to-end encrypted · AES-256-GCM</span>
+                  <span className="text-[10px] text-gray-600 truncate">
+                    {pfsActive ? 'E2EE PFS Tunnel Active' : 'E2EE Tunnel Active'}
+                  </span>
                 </div>
               </div>
             </div>
+
+            {/* Header Options */}
+            {peerOnline && (
+              <div className="flex items-center gap-2 shrink-0">
+                {/* Visual Fingerprint badge */}
+                {fingerprint && (
+                  <div 
+                    className="hidden sm:flex items-center gap-1.5 bg-black/40 border border-amber-500/15 px-2.5 py-1 rounded-xl text-[10px] text-amber-300 font-mono shadow-inner select-none cursor-help"
+                    title={`Verified Fingerprint: ${fingerprint.text}${peerSalt ? ' | salt-verified' : ''}`}
+                  >
+                    <span className="font-bold text-gray-500 text-[9px]">PFS:</span>
+                    <span>{fingerprint.emojis.join(' ')}</span>
+                    <span className="text-amber-500/40">|</span>
+                    <span className="text-[9px] font-semibold">{fingerprint.text.substring(0, 9)}</span>
+                  </div>
+                )}
+
+                {/* Save Contact Shortcut */}
+                {peerDuckId && !contacts.some(c => c.duckId === peerDuckId) && (
+                  <button
+                    onClick={() => {
+                      const alias = prompt(`Save secure partner (${peerName}) to contact book:`);
+                      if (alias) handleAddContact(peerDuckId, alias);
+                    }}
+                    className="w-8 h-8 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/20 flex items-center justify-center text-emerald-400 transition-all"
+                    title="Quick-save contact"
+                  >
+                    <span className="material-symbols-rounded text-lg">person_add</span>
+                  </button>
+                )}
+
+                {/* Toggle Search */}
+                <button
+                  onClick={() => {
+                    setShowSearch(s => !s);
+                    setSearchQuery('');
+                  }}
+                  className={`w-8 h-8 rounded-lg flex items-center justify-center transition-all ${
+                    showSearch
+                      ? 'bg-amber-500/20 border border-amber-500/40 text-amber-400'
+                      : 'bg-gray-800 border border-gray-700 text-gray-400 hover:text-white hover:bg-gray-700'
+                  }`}
+                  title="Search messages"
+                >
+                  <span className="material-symbols-rounded text-lg">search</span>
+                </button>
+              </div>
+            )}
+
             <button
               onClick={() => setShowLeaveConfirm(true)}
               className="px-3 py-1.5 rounded-lg text-xs text-red-400/70 hover:text-red-400 hover:bg-red-500/10 transition-all border border-transparent hover:border-red-500/15 shrink-0 flex items-center gap-1.5"
@@ -1298,6 +2080,30 @@ export default function App() {
           </div>
         )}
 
+        {/* In-Chat Search Bar */}
+        {showSearch && (
+          <div className="shrink-0 border-b border-gray-800 bg-gray-905 p-2 z-20" style={{ animation: 'slideDown 0.2s ease-out' }}>
+            <div className="max-w-3xl mx-auto flex items-center gap-2.5 px-3 py-1.5 bg-black/45 border border-gray-800 rounded-xl shadow-inner">
+              <span className="material-symbols-rounded text-gray-500 text-sm">search</span>
+              <input
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+                placeholder="Search decrypted message history..."
+                className="flex-1 bg-transparent text-xs text-white placeholder-gray-600 focus:outline-none"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery('')}
+                  className="w-5 h-5 rounded-md hover:bg-gray-800 flex items-center justify-center text-gray-500 hover:text-white transition-all"
+                  title="Clear search"
+                >
+                  <span className="material-symbols-rounded text-sm">close</span>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Messages Area */}
         <div className="flex-1 overflow-y-auto px-4 py-4 relative z-10">
           <div className="max-w-3xl mx-auto space-y-3">
@@ -1333,7 +2139,13 @@ export default function App() {
             )}
 
             {/* Messages */}
-            {messages.map(msg => (
+            {messages.filter(msg => {
+              if (!searchQuery) return true;
+              const query = searchQuery.toLowerCase();
+              const textMatch = msg.text?.toLowerCase().includes(query);
+              const fileMatch = msg.file?.name?.toLowerCase().includes(query);
+              return textMatch || fileMatch;
+            }).map(msg => (
               <div
                 key={msg.id}
                 className={`flex ${msg.isMine ? 'justify-end' : 'justify-start'}`}
@@ -1394,10 +2206,78 @@ export default function App() {
                   {!msg.isMine && (
                     <p className="text-[11px] font-medium text-emerald-400/70 mb-0.5">{msg.senderName}</p>
                   )}
-                  {msg.stickerId ? (
+
+                  {/* Duck Sticker */}
+                  {msg.stickerId && (
                     <DuckSticker id={msg.stickerId} />
-                  ) : (
-                    <p className="text-sm text-gray-100 leading-relaxed break-words whitespace-pre-wrap">{msg.text}</p>
+                  )}
+
+                  {/* Encrypted Decrypted File - Images */}
+                  {msg.file && msg.file.type.startsWith('image/') && (
+                    <div className="relative rounded-xl overflow-hidden border border-amber-500/10 max-w-full my-1.5 bg-black/25 select-none">
+                      <img
+                        src={msg.file.data}
+                        alt={msg.file.name}
+                        className="max-h-60 w-auto object-contain cursor-zoom-in"
+                        onClick={() => {
+                          const w = window.open();
+                          if (w && msg.file) w.document.write(`<img src="${msg.file.data}" style="max-width:100%; max-height:100vh; display:block; margin:auto;" />`);
+                        }}
+                      />
+                    </div>
+                  )}
+
+                  {/* Encrypted Decrypted File - Other files */}
+                  {msg.file && !msg.file.type.startsWith('image/') && (
+                    <div className="flex items-center gap-3 p-2.5 bg-black/45 border border-amber-500/10 rounded-xl my-1.5 max-w-xs select-none">
+                      <div className="w-10 h-10 rounded-xl bg-amber-500/10 flex items-center justify-center text-amber-400 shrink-0">
+                        <span className="material-symbols-rounded text-xl">description</span>
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-semibold text-gray-205 truncate" title={msg.file.name}>{msg.file.name}</p>
+                        <p className="text-[10px] text-gray-500 font-mono mt-0.5">{fmtSize(msg.file.size)}</p>
+                      </div>
+                      <a
+                        href={msg.file.data}
+                        download={msg.file.name}
+                        className="w-8 h-8 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-905 flex items-center justify-center transition-all shrink-0 active:scale-95"
+                        title="Download decrypted file"
+                      >
+                        <span className="material-symbols-rounded text-sm">download</span>
+                      </a>
+                    </div>
+                  )}
+
+                  {/* Encrypted Decrypted Audio Voice Notes */}
+                  {msg.audio && (
+                    <VoicePlayer data={msg.audio.data} duration={msg.audio.duration} />
+                  )}
+
+                  {/* Text Message with highlighting */}
+                  {msg.text && (
+                    <p className="text-sm text-gray-100 leading-relaxed break-words whitespace-pre-wrap">
+                      {searchQuery ? (
+                        (() => {
+                          const parts = msg.text.split(new RegExp(`(${searchQuery.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')})`, 'gi'));
+                          return parts.map((part, i) => 
+                            part.toLowerCase() === searchQuery.toLowerCase()
+                              ? <mark key={i} className="bg-amber-400 text-gray-900 rounded-sm px-0.5 font-semibold">{part}</mark>
+                              : part
+                          );
+                        })()
+                      ) : (
+                        msg.text
+                      )}
+                    </p>
+                  )}
+
+                  {/* Ephemeral Timer Countdown */}
+                  {msg.expiresIn && (
+                    <SelfDestructTimer
+                      timestamp={msg.timestamp}
+                      expiresIn={msg.expiresIn}
+                      onExpire={() => purgeMessage(msg.id)}
+                    />
                   )}
                   
                   {/* Reactions Pill Display */}
@@ -1430,9 +2310,21 @@ export default function App() {
                     </div>
                   )}
 
-                  <div className="flex items-center justify-end gap-1.5 mt-1">
+                  {/* Delivery Lock Receipts */}
+                  <div className="flex items-center justify-end gap-1.5 mt-1 select-none">
                     <span className="text-[10px] text-gray-600">{fmtTime(msg.timestamp)}</span>
-                    <span className="material-symbols-rounded text-xs text-amber-400/40">lock</span>
+                    {msg.isMine ? (
+                      <span 
+                        className={`material-symbols-rounded text-sm transition-colors ${
+                          msg.read ? 'text-amber-400 font-semibold' : 'text-gray-600'
+                        }`}
+                        title={msg.read ? 'Read by partner' : 'Delivered securely'}
+                      >
+                        {msg.read ? 'done_all' : 'done'}
+                      </span>
+                    ) : (
+                      <span className="material-symbols-rounded text-[11px] text-amber-500/40">lock</span>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1549,10 +2441,23 @@ export default function App() {
             )}
 
             <div className="py-3 flex gap-2">
+              <input
+                type="file"
+                ref={fileInputRef}
+                onChange={e => {
+                  const file = e.target.files?.[0];
+                  if (file) {
+                    sendFileMessage(file);
+                    e.target.value = '';
+                  }
+                }}
+                className="hidden"
+              />
+
               {/* Sticker Picker Trigger */}
               <button
                 onClick={() => setShowStickerPicker(p => !p)}
-                disabled={!peerOnline}
+                disabled={!peerOnline || isRecording}
                 className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all shrink-0 active:scale-95 ${
                   showStickerPicker
                     ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
@@ -1563,21 +2468,91 @@ export default function App() {
                 <span className="material-symbols-rounded text-xl">sticky_note_2</span>
               </button>
 
-              <input
-                value={chatInput}
-                onChange={e => handleInputChange(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
-                placeholder={peerOnline ? 'Type a message...' : 'Waiting for connection...'}
-                disabled={!peerOnline}
-                className="flex-1 bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-amber-500/40 focus:ring-1 focus:ring-amber-500/20 transition-all disabled:opacity-40"
-              />
+              {/* Share File Attachment Trigger */}
               <button
-                onClick={sendMessage}
-                disabled={!chatInput.trim() || !peerOnline}
-                className="px-5 py-3 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-500 text-gray-900 font-bold text-sm disabled:opacity-20 disabled:cursor-not-allowed hover:shadow-lg hover:shadow-amber-500/25 active:scale-95 transition-all shrink-0 flex items-center justify-center"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={!peerOnline || isRecording}
+                className="w-11 h-11 rounded-xl bg-gray-800 border border-gray-700 text-gray-400 hover:text-white hover:bg-gray-700/60 flex items-center justify-center shrink-0 transition-all active:scale-95 disabled:opacity-40"
+                title="Share file (<1.5MB)"
               >
-                <span className="material-symbols-rounded text-xl">send</span>
+                <span className="material-symbols-rounded text-xl">attach_file</span>
               </button>
+
+              {/* Ephemeral Timer Duration Selector */}
+              <button
+                onClick={() => {
+                  const durations = [0, 10000, 30000, 60000, 300000];
+                  const nextIndex = (durations.indexOf(ephemeralTimer) + 1) % durations.length;
+                  setEphemeralTimer(durations[nextIndex]);
+                }}
+                disabled={!peerOnline || isRecording}
+                className={`w-11 h-11 rounded-xl flex flex-col items-center justify-center border transition-all shrink-0 active:scale-95 disabled:opacity-40 ${
+                  ephemeralTimer > 0
+                    ? 'bg-amber-500/20 border-amber-500/45 text-amber-400'
+                    : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-white hover:bg-gray-700/60'
+                }`}
+                title="Self-destruct timer"
+              >
+                <span className="material-symbols-rounded text-lg">timer</span>
+                <span className="text-[8px] font-bold mt-0.5">
+                  {ephemeralTimer === 0 ? 'Off' : ephemeralTimer === 10000 ? '10s' : ephemeralTimer === 30000 ? '30s' : ephemeralTimer === 60000 ? '1m' : '5m'}
+                </span>
+              </button>
+
+              {isRecording ? (
+                /* Voice Recorder Pulsing Controls Panel */
+                <div className="flex-1 bg-gray-900 border border-red-500/30 rounded-xl px-4 py-2 flex items-center justify-between animate-pulse">
+                  <div className="flex items-center gap-3">
+                    <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-ping shrink-0" />
+                    <span className="text-xs text-gray-300 font-mono">{fmtDuration(recordingDuration)}</span>
+                    <span className="text-[11px] text-gray-500 italic hidden sm:inline">Recording voice note...</span>
+                  </div>
+                  <div className="flex gap-2">
+                    <button 
+                      onClick={() => stopRecording(true)} 
+                      className="px-3 py-1 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white text-xs transition-all"
+                    >
+                      Cancel
+                    </button>
+                    <button 
+                      onClick={() => stopRecording(false)} 
+                      className="px-3 py-1 rounded-lg bg-red-650 hover:bg-red-500 text-white font-bold text-xs transition-all flex items-center gap-1"
+                    >
+                      <span className="material-symbols-rounded text-sm">send</span> Send
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                /* Regular Text Input & Send triggers */
+                <>
+                  <input
+                    value={chatInput}
+                    onChange={e => handleInputChange(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
+                    placeholder={peerOnline ? 'Type a message...' : 'Waiting for connection...'}
+                    disabled={!peerOnline}
+                    className="flex-1 bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-amber-500/40 focus:ring-1 focus:ring-amber-500/20 transition-all disabled:opacity-40"
+                  />
+
+                  {!chatInput.trim() && peerOnline ? (
+                    <button
+                      onClick={startRecording}
+                      className="w-11 h-11 rounded-xl bg-gray-800 border border-gray-700 text-gray-400 hover:text-amber-400 hover:bg-gray-700/60 flex items-center justify-center shrink-0 transition-all active:scale-95"
+                      title="Record a voice note"
+                    >
+                      <span className="material-symbols-rounded text-xl">mic</span>
+                    </button>
+                  ) : (
+                    <button
+                      onClick={sendMessage}
+                      disabled={!chatInput.trim() || !peerOnline}
+                      className="px-5 py-3 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-500 text-gray-900 font-bold text-sm disabled:opacity-20 disabled:cursor-not-allowed hover:shadow-lg hover:shadow-amber-500/25 active:scale-95 transition-all shrink-0 flex items-center justify-center"
+                    >
+                      <span className="material-symbols-rounded text-xl">send</span>
+                    </button>
+                  )}
+                </>
+              )}
             </div>
           </div>
         </div>
