@@ -117,7 +117,11 @@ export default function App() {
   const [isCreator, setIsCreator] = useState(false);
 
   // ---- Refs ----
-  const channelRef = useRef<BroadcastChannel | null>(null);
+  interface NtfyChannel {
+    postMessage: (event: BCEvent) => Promise<void>;
+    close: () => void;
+  }
+  const channelRef = useRef<NtfyChannel | null>(null);
   const secretRef = useRef('');
   const userRef = useRef<User | null>(null);
   const msgEndRef = useRef<HTMLDivElement>(null);
@@ -199,8 +203,31 @@ export default function App() {
     }
 
     secretRef.current = secret;
-    const ch = new BroadcastChannel(`ddy-${roomId}`);
-    channelRef.current = ch;
+
+    // Create EventSource to listen to incoming messages from ntfy.sh
+    const es = new EventSource(`https://ntfy.sh/ddy-${roomId}/sse`);
+
+    // Define the publish function
+    const postMessage = async (event: BCEvent) => {
+      try {
+        await fetch(`https://ntfy.sh/ddy-${roomId}`, {
+          method: 'POST',
+          body: JSON.stringify(event),
+          keepalive: true,
+        });
+      } catch (err) {
+        console.error('Failed to publish to ntfy:', err);
+      }
+    };
+
+    const channel: NtfyChannel = {
+      postMessage,
+      close: () => {
+        es.close();
+      }
+    };
+
+    channelRef.current = channel;
 
     setChatRoom({ roomId, secret });
     setMessages([]);
@@ -210,33 +237,62 @@ export default function App() {
     setIsCreator(creator);
     setView('chat');
 
+    // Send initial join message
     const u = userRef.current;
     if (u) {
-      ch.postMessage({ type: 'join', senderDuckId: u.duckId, senderName: u.username, timestamp: Date.now() } satisfies BCEvent);
+      postMessage({ type: 'join', senderDuckId: u.duckId, senderName: u.username, timestamp: Date.now() } satisfies BCEvent);
     }
 
-    ch.onmessage = async (ev: MessageEvent<BCEvent>) => {
-      const d = ev.data;
-      if (d.type === 'join') {
-        setPeerOnline(true);
-        setPeerName(d.senderName);
-        setShowCodeBanner(false);
-        const me = userRef.current;
-        if (me && d.senderDuckId !== me.duckId) {
-          ch.postMessage({ type: 'join', senderDuckId: me.duckId, senderName: me.username, timestamp: Date.now() } satisfies BCEvent);
+    // Keep track of our current peerOnline state using a local variable so we can safely inspect it inside the async callback
+    let currentPeerOnline = false;
+
+    es.onmessage = async (ev: MessageEvent) => {
+      try {
+        const ntfyData = JSON.parse(ev.data);
+        if (ntfyData.event !== 'message' || !ntfyData.message) {
+          return; // Skip keepalive or other events
         }
-      }
-      if (d.type === 'message' && d.payload) {
-        try {
-          const txt = await decryptMessage(d.payload, secretRef.current);
-          setMessages(p => [...p, { id: genId(), text: txt, isMine: false, timestamp: d.timestamp, senderName: d.senderName }]);
-        } catch { /* decryption failed */ }
-      }
-      if (d.type === 'leave') {
-        setPeerOnline(false);
-        setPeerName('');
+
+        const d = JSON.parse(ntfyData.message) as BCEvent;
+        const me = userRef.current;
+        if (!me || d.senderDuckId === me.duckId) {
+          return; // Ignore messages from ourselves
+        }
+
+        if (d.type === 'join') {
+          const wasOnline = currentPeerOnline;
+          setPeerOnline(true);
+          currentPeerOnline = true;
+          setPeerName(d.senderName);
+          setShowCodeBanner(false);
+
+          // Symmetrical peer connection: if we didn't know they were online, reply with our join
+          if (!wasOnline) {
+            postMessage({ type: 'join', senderDuckId: me.duckId, senderName: me.username, timestamp: Date.now() } satisfies BCEvent);
+          }
+        }
+        if (d.type === 'message' && d.payload) {
+          try {
+            const txt = await decryptMessage(d.payload, secretRef.current);
+            setMessages(p => [...p, { id: genId(), text: txt, isMine: false, timestamp: d.timestamp, senderName: d.senderName }]);
+          } catch (e) {
+            console.error('Decryption failed:', e);
+          }
+        }
+        if (d.type === 'leave') {
+          setPeerOnline(false);
+          currentPeerOnline = false;
+          setPeerName('');
+        }
+      } catch (err) {
+        console.error('Error handling ntfy event:', err);
       }
     };
+
+    es.onerror = (err) => {
+      console.error('EventSource error:', err);
+    };
+
   }, []);
 
   const sendMessage = useCallback(async () => {
@@ -647,7 +703,7 @@ export default function App() {
 
           {/* Note */}
           <p className="text-center text-[11px] text-gray-700 mt-8">
-            Open two tabs in the same browser to test — each tab is a different user.
+            Open on another device or tab to test the real-time end-to-end encrypted connection.
           </p>
         </main>
       </div>
