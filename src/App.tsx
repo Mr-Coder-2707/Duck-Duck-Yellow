@@ -430,6 +430,8 @@ export default function App() {
   const [replyingTo, setReplyingTo] = useState<ChatMsg | null>(null);
   const [hoveredMessageId, setHoveredMessageId] = useState<string | null>(null);
   const [showStickerPicker, setShowStickerPicker] = useState(false);
+  const [showActionsMenu, setShowActionsMenu] = useState(false);
+  const [showTimerMenu, setShowTimerMenu] = useState(false);
 
   // ---- Typing states & refs ----
   const [peerTyping, setPeerTyping] = useState(false);
@@ -1253,6 +1255,9 @@ export default function App() {
     setPfsActive(false);
     setFingerprint(null);
     setEphemeralTimer(0);
+    setShowActionsMenu(false);
+    setShowTimerMenu(false);
+    setShowStickerPicker(false);
     if (peerTypingTimeoutRef.current) clearTimeout(peerTypingTimeoutRef.current);
     if (localTypingTimeoutRef.current) clearTimeout(localTypingTimeoutRef.current);
     isLocalTypingRef.current = false;
@@ -2368,8 +2373,8 @@ export default function App() {
         </div>
 
         {/* Input Area */}
-        <div className="shrink-0 border-t border-gray-800/60 bg-gray-900/70 backdrop-blur-sm z-20">
-          <div className="max-w-3xl mx-auto px-4">
+        <div className="shrink-0 border-t border-gray-800/60 bg-gray-900/70 backdrop-blur-sm z-20 relative">
+          <div className="max-w-3xl mx-auto px-4 relative">
             {/* Sticker Picker Tray */}
             {showStickerPicker && (
               <div 
@@ -2440,7 +2445,105 @@ export default function App() {
               </div>
             )}
 
-            <div className="py-3 flex gap-2">
+            {/* Absolute-positioned floating popover menus */}
+            {showActionsMenu && !isRecording && (
+              <div 
+                className="absolute bottom-16 left-4 bg-gray-950/95 border border-gray-800/80 backdrop-blur-md rounded-2xl p-1.5 shadow-2xl flex flex-col gap-1 z-40 w-52 animate-slide-up"
+                style={{ animation: 'slideUp 0.15s ease-out' }}
+              >
+                {/* 1. Animated Sticker picker option */}
+                <button
+                  onClick={() => {
+                    setShowStickerPicker(p => !p);
+                    setShowActionsMenu(false);
+                  }}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-amber-500/10 text-gray-300 hover:text-amber-400 transition-all text-left ${
+                    showStickerPicker ? 'bg-amber-500/10 text-amber-400' : ''
+                  }`}
+                >
+                  <span className="material-symbols-rounded text-lg shrink-0">sticky_note_2</span>
+                  <span className="text-xs font-semibold">Stickers</span>
+                </button>
+
+                {/* 2. File attachment option */}
+                <button
+                  onClick={() => {
+                    fileInputRef.current?.click();
+                    setShowActionsMenu(false);
+                  }}
+                  className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-amber-500/10 text-gray-300 hover:text-amber-400 transition-all text-left"
+                >
+                  <span className="material-symbols-rounded text-lg shrink-0">attach_file</span>
+                  <span className="text-xs font-semibold">Share File</span>
+                </button>
+
+                {/* 3. Ephemeral self-destruct timer option */}
+                <button
+                  onClick={() => {
+                    setShowTimerMenu(true);
+                    setShowActionsMenu(false);
+                  }}
+                  className="w-full flex items-center justify-between px-3 py-2.5 rounded-xl hover:bg-amber-500/10 text-gray-300 hover:text-amber-400 transition-all text-left"
+                >
+                  <div className="flex items-center gap-3">
+                    <span className="material-symbols-rounded text-lg shrink-0">timer</span>
+                    <span className="text-xs font-semibold">Self-Destruct</span>
+                  </div>
+                  <span className="text-[10px] bg-amber-500/20 text-amber-400 font-bold px-1.5 py-0.5 rounded-md border border-amber-500/30">
+                    {ephemeralTimer === 0 ? 'Off' : ephemeralTimer === 10000 ? '10s' : ephemeralTimer === 30000 ? '30s' : ephemeralTimer === 60000 ? '1m' : ephemeralTimer === 300000 ? '5m' : '1h'}
+                  </span>
+                </button>
+              </div>
+            )}
+
+            {showTimerMenu && !isRecording && (
+              <div 
+                className="absolute bottom-16 left-4 bg-gray-950/95 border border-gray-800/80 backdrop-blur-md rounded-2xl p-2 shadow-2xl flex flex-col gap-1 z-40 w-56 animate-slide-up"
+                style={{ animation: 'slideUp 0.15s ease-out' }}
+              >
+                <div className="flex items-center justify-between px-2 pb-1.5 mb-1 border-b border-gray-800/60">
+                  <span className="text-[10px] font-bold text-amber-400 uppercase tracking-wide">Self-Destruct Time</span>
+                  <button 
+                    onClick={() => {
+                      setShowTimerMenu(false);
+                      setShowActionsMenu(true);
+                    }}
+                    className="text-gray-500 hover:text-white transition-all flex items-center"
+                  >
+                    <span className="material-symbols-rounded text-sm">arrow_back</span>
+                  </button>
+                </div>
+
+                {[
+                  { value: 0, label: '🚫 Disable (Off)' },
+                  { value: 10000, label: '⏱️ 10 Seconds' },
+                  { value: 30000, label: '⏱️ 30 Seconds' },
+                  { value: 60000, label: '⏱️ 1 Minute' },
+                  { value: 300000, label: '⏱️ 5 Minutes' },
+                  { value: 3600000, label: '⏱️ 1 Hour' }
+                ].map(opt => (
+                  <button
+                    key={opt.value}
+                    onClick={() => {
+                      setEphemeralTimer(opt.value);
+                      setShowTimerMenu(false);
+                    }}
+                    className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-semibold transition-all ${
+                      ephemeralTimer === opt.value
+                        ? 'bg-amber-500/25 text-amber-300 border border-amber-500/20'
+                        : 'text-gray-300 hover:bg-gray-800 hover:text-white'
+                    }`}
+                  >
+                    <span>{opt.label}</span>
+                    {ephemeralTimer === opt.value && (
+                      <span className="material-symbols-rounded text-sm text-amber-400">check</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div className="py-3 flex gap-2 items-center">
               <input
                 type="file"
                 ref={fileInputRef}
@@ -2454,48 +2557,25 @@ export default function App() {
                 className="hidden"
               />
 
-              {/* Sticker Picker Trigger */}
+              {/* Actions Toggle Trigger Button */}
               <button
-                onClick={() => setShowStickerPicker(p => !p)}
+                onClick={() => {
+                  setShowActionsMenu(p => !p);
+                  setShowTimerMenu(false);
+                }}
                 disabled={!peerOnline || isRecording}
-                className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all shrink-0 active:scale-95 ${
-                  showStickerPicker
+                className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all shrink-0 active:scale-95 disabled:opacity-40 ${
+                  showActionsMenu || showTimerMenu
                     ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
                     : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-white hover:bg-gray-700/60'
                 }`}
-                title="Send animated sticker"
+                title="Open action menu"
               >
-                <span className="material-symbols-rounded text-xl">sticky_note_2</span>
-              </button>
-
-              {/* Share File Attachment Trigger */}
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                disabled={!peerOnline || isRecording}
-                className="w-11 h-11 rounded-xl bg-gray-800 border border-gray-700 text-gray-400 hover:text-white hover:bg-gray-700/60 flex items-center justify-center shrink-0 transition-all active:scale-95 disabled:opacity-40"
-                title="Share file (<1.5MB)"
-              >
-                <span className="material-symbols-rounded text-xl">attach_file</span>
-              </button>
-
-              {/* Ephemeral Timer Duration Selector */}
-              <button
-                onClick={() => {
-                  const durations = [0, 10000, 30000, 60000, 300000];
-                  const nextIndex = (durations.indexOf(ephemeralTimer) + 1) % durations.length;
-                  setEphemeralTimer(durations[nextIndex]);
-                }}
-                disabled={!peerOnline || isRecording}
-                className={`w-11 h-11 rounded-xl flex flex-col items-center justify-center border transition-all shrink-0 active:scale-95 disabled:opacity-40 ${
-                  ephemeralTimer > 0
-                    ? 'bg-amber-500/20 border-amber-500/45 text-amber-400'
-                    : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-white hover:bg-gray-700/60'
-                }`}
-                title="Self-destruct timer"
-              >
-                <span className="material-symbols-rounded text-lg">timer</span>
-                <span className="text-[8px] font-bold mt-0.5">
-                  {ephemeralTimer === 0 ? 'Off' : ephemeralTimer === 10000 ? '10s' : ephemeralTimer === 30000 ? '30s' : ephemeralTimer === 60000 ? '1m' : '5m'}
+                <span 
+                  className="material-symbols-rounded text-xl transition-transform duration-200" 
+                  style={{ transform: showActionsMenu || showTimerMenu ? 'rotate(45deg)' : 'none' }}
+                >
+                  add
                 </span>
               </button>
 
@@ -2531,8 +2611,22 @@ export default function App() {
                     onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
                     placeholder={peerOnline ? 'Type a message...' : 'Waiting for connection...'}
                     disabled={!peerOnline}
-                    className="flex-1 bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-amber-500/40 focus:ring-1 focus:ring-amber-500/20 transition-all disabled:opacity-40"
+                    className="flex-1 bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-amber-500/40 focus:ring-1 focus:ring-amber-500/20 transition-all disabled:opacity-40 min-w-0"
                   />
+
+                  {/* Self-Destruct Timer Quick Indicator Badge */}
+                  {ephemeralTimer > 0 && (
+                    <button
+                      onClick={() => setShowTimerMenu(true)}
+                      className="h-11 px-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-400 flex items-center gap-1 text-[10px] font-bold transition-all hover:bg-amber-500/20 shrink-0"
+                      title="Timer active. Tap to change."
+                    >
+                      <span className="material-symbols-rounded text-sm">timer</span>
+                      <span>
+                        {ephemeralTimer === 10000 ? '10s' : ephemeralTimer === 30000 ? '30s' : ephemeralTimer === 60000 ? '1m' : ephemeralTimer === 300000 ? '5m' : '1h'}
+                      </span>
+                    </button>
+                  )}
 
                   {!chatInput.trim() && peerOnline ? (
                     <button
