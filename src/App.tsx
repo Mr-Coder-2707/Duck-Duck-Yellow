@@ -426,30 +426,37 @@ export default function App() {
           return; // Ignore messages from ourselves
         }
 
-        if (d.type === 'join') {
-          const wasOnline = currentPeerOnline;
+        // Symmetrical/Self-healing peer connection:
+        // If we receive ANY event from the peer, they are online!
+        if (!currentPeerOnline) {
           setPeerOnline(true);
           currentPeerOnline = true;
           setPeerName(d.senderName);
           setShowCodeBanner(false);
 
-          // Symmetrical peer connection: if we didn't know they were online, reply with our join
-          if (!wasOnline) {
-            postMessage({ type: 'join', senderDuckId: me.duckId, senderName: me.username, timestamp: Date.now() } satisfies BCEvent);
-          }
+          // We always send a join event when first connecting, whether they sent a join or any other event,
+          // so that the peer also sets their peerOnline to true.
+          postMessage({ type: 'join', senderDuckId: me.duckId, senderName: me.username, timestamp: Date.now() } satisfies BCEvent);
         }
+
         if (d.type === 'message' && d.payload) {
           try {
             const txt = await decryptMessage(d.payload, secretRef.current);
+            let messageId = genId(); // Default fallback
             let decryptedText = txt;
             let replyToData = undefined;
             let stickerIdData = undefined;
             try {
               const parsed = JSON.parse(txt);
-              if (parsed && (typeof parsed.text === 'string' || parsed.stickerId)) {
-                decryptedText = parsed.text || '';
-                replyToData = parsed.replyTo;
-                stickerIdData = parsed.stickerId;
+              if (parsed) {
+                if (parsed.id) {
+                  messageId = parsed.id;
+                }
+                if (typeof parsed.text === 'string' || parsed.stickerId) {
+                  decryptedText = parsed.text || '';
+                  replyToData = parsed.replyTo;
+                  stickerIdData = parsed.stickerId;
+                }
               }
             } catch {
               // Legacy plain text message
@@ -457,7 +464,7 @@ export default function App() {
 
             setMessages(p => {
               const updated = [...p, {
-                id: genId(),
+                id: messageId,
                 text: decryptedText,
                 isMine: false,
                 timestamp: d.timestamp,
@@ -607,7 +614,10 @@ export default function App() {
       senderName: replyingTo.senderName
     } : undefined;
 
+    const messageId = genId();
+
     const payloadObj = {
+      id: messageId,
       text: "",
       stickerId,
       replyTo: replyToData
@@ -626,7 +636,7 @@ export default function App() {
 
     setMessages(p => {
       const updated = [...p, {
-        id: genId(),
+        id: messageId,
         text: "",
         stickerId,
         isMine: true,
@@ -666,7 +676,10 @@ export default function App() {
       senderName: replyingTo.senderName
     } : undefined;
 
+    const messageId = genId();
+
     const payloadObj = {
+      id: messageId,
       text,
       replyTo: replyToData
     };
@@ -684,7 +697,7 @@ export default function App() {
 
     setMessages(p => {
       const updated = [...p, {
-        id: genId(),
+        id: messageId,
         text,
         isMine: true,
         timestamp: Date.now(),
