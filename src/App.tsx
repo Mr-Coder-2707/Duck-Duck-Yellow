@@ -569,13 +569,13 @@ export default function App() {
 
     secretRef.current = secret;
 
-    // Create EventSource to listen to incoming messages from ntfy.sh
-    const es = new EventSource(`https://ntfy.sh/ddy-${roomId}/sse`);
+    // Create EventSource to listen to incoming messages from ntfy.adminforge.de
+    const es = new EventSource(`https://ntfy.adminforge.de/ddy-${roomId}/sse`);
 
     // Define the publish function
     const postMessage = async (event: BCEvent) => {
       try {
-        await fetch(`https://ntfy.sh/ddy-${roomId}`, {
+        await fetch(`https://ntfy.adminforge.de/ddy-${roomId}`, {
           method: 'POST',
           body: JSON.stringify(event),
           keepalive: true,
