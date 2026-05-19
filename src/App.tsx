@@ -57,11 +57,15 @@ interface ChatMsg {
 }
 
 interface BCEvent {
-  type: 'message' | 'join' | 'leave' | 'typing' | 'reaction' | 'salt' | 'read';
+  type: 'message' | 'join' | 'leave' | 'typing' | 'reaction' | 'salt' | 'read' | 'chunk';
   senderDuckId: string;
   senderName: string;
   payload?: string;
   timestamp: number;
+  chunkId?: string;
+  chunkIndex?: number;
+  chunkTotal?: number;
+  chunkPart?: string;
 }
 
 type View = 'auth' | 'dashboard' | 'chat';
@@ -112,6 +116,45 @@ function fmtTime(ts: number) {
 }
 function copyText(text: string) {
   navigator.clipboard.writeText(text).catch(() => {});
+}
+
+function createGuestUser(): User {
+  const duckId = generateDuckId();
+  return {
+    username: `Guest ${duckId.slice(-4)}`,
+    duckId,
+  };
+}
+
+function buildInviteLink(code: string) {
+  return `${window.location.origin}${window.location.pathname}#invite=${encodeURIComponent(code)}`;
+}
+
+function readInviteCodeFromLocation() {
+  const hash = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
+  const hashParams = new URLSearchParams(hash);
+  const inviteFromHash = hashParams.get('invite');
+  if (inviteFromHash) return inviteFromHash;
+
+  const queryParams = new URLSearchParams(window.location.search);
+  return queryParams.get('invite') || '';
+}
+
+function clearInviteFromLocation() {
+  const { pathname, search } = window.location;
+  window.history.replaceState(null, '', `${pathname}${search}`);
+}
+
+// Feature flags to enable/disable attachments and voice
+const ENABLE_ATTACHMENTS = false; // files & images
+const ENABLE_VOICE = false; // voice notes
+
+function splitIntoChunks(value: string, chunkSize: number) {
+  const chunks: string[] = [];
+  for (let index = 0; index < value.length; index += chunkSize) {
+    chunks.push(value.slice(index, index + chunkSize));
+  }
+  return chunks;
 }
 
 function playQuack() {
@@ -411,6 +454,7 @@ export default function App() {
 
   // ---- Dashboard ----
   const [yellowCode, setYellowCode] = useState('');
+  const [inviteLink, setInviteLink] = useState('');
   const [joinCode, setJoinCode] = useState('');
   const [copiedCode, setCopiedCode] = useState(false);
   const [joinError, setJoinError] = useState('');
@@ -458,6 +502,7 @@ export default function App() {
   const [peerSalt, setPeerSalt] = useState<string | null>(null);
   const [pfsActive, setPfsActive] = useState(false);
   const [fingerprint, setFingerprint] = useState<{ text: string; emojis: string[] } | null>(null);
+  const [pendingInvite, setPendingInvite] = useState<{ roomId: string; secret: string } | null>(null);
 
   // 3. Ephemeral Messages
   const [ephemeralTimer, setEphemeralTimer] = useState<number>(0); // 0 means off, otherwise ms duration
@@ -569,17 +614,48 @@ export default function App() {
 
     secretRef.current = secret;
 
+    const RELAY_INLINE_LIMIT = 3200;
+    const RELAY_CHUNK_SIZE = 1200;
+    const chunkBuffers = new Map<string, string[]>();
+
     // Create EventSource to listen to incoming messages from ntfy.adminforge.de
     const es = new EventSource(`https://ntfy.adminforge.de/ddy-${roomId}/sse`);
+
+    const sendRaw = async (body: string) => {
+      await fetch(`https://ntfy.adminforge.de/ddy-${roomId}`, {
+        method: 'POST',
+        body,
+        keepalive: true,
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+        },
+      });
+    };
 
     // Define the publish function
     const postMessage = async (event: BCEvent) => {
       try {
-        await fetch(`https://ntfy.adminforge.de/ddy-${roomId}`, {
-          method: 'POST',
-          body: JSON.stringify(event),
-          keepalive: true,
-        });
+        const serialized = JSON.stringify(event);
+        if (serialized.length <= RELAY_INLINE_LIMIT) {
+          await sendRaw(serialized);
+          return;
+        }
+
+        const chunkId = genId();
+        const parts = splitIntoChunks(serialized, RELAY_CHUNK_SIZE);
+        for (let index = 0; index < parts.length; index++) {
+          const chunkEnvelope: BCEvent = {
+            type: 'chunk',
+            senderDuckId: event.senderDuckId,
+            senderName: event.senderName,
+            timestamp: event.timestamp,
+            chunkId,
+            chunkIndex: index,
+            chunkTotal: parts.length,
+            chunkPart: parts[index],
+          };
+          await sendRaw(JSON.stringify(chunkEnvelope));
+        }
       } catch (err) {
         console.error('Failed to publish to ntfy:', err);
       }
@@ -655,6 +731,202 @@ export default function App() {
     // Keep track of our current peerOnline state using a local variable so we can safely inspect it inside the async callback
     let currentPeerOnline = false;
 
+    const handleIncomingEvent = async (d: BCEvent) => {
+      const me = userRef.current;
+      if (!me || d.senderDuckId === me.duckId) {
+        return;
+      }
+
+      if (!currentPeerOnline) {
+        setPeerOnline(true);
+        currentPeerOnline = true;
+        setPeerName(d.senderName);
+        setPeerDuckId(d.senderDuckId);
+        setShowCodeBanner(false);
+
+        sendSalt(secret);
+        postMessage({ type: 'join', senderDuckId: me.duckId, senderName: me.username, timestamp: Date.now() } satisfies BCEvent);
+      }
+
+      if (d.type === 'salt' && d.payload) {
+        try {
+          const decryptedSalt = await decryptMessage(d.payload, secret);
+          setPeerSalt(decryptedSalt);
+
+          const salts = [localSalt, decryptedSalt].sort();
+          const derivedKey = await derivePfsKey(secret, salts[0], salts[1]);
+
+          secretRef.current = derivedKey;
+          setPfsActive(true);
+
+          const fp = await generateKeyFingerprint(derivedKey);
+          setFingerprint(fp);
+        } catch (e) {
+          console.error('PFS derivation failed:', e);
+        }
+      }
+
+      if (d.type === 'message' && d.payload) {
+        try {
+          const txt = await decryptMessage(d.payload, secretRef.current);
+          let messageId = genId();
+          let decryptedText = txt;
+          let replyToData = undefined;
+          let stickerIdData = undefined;
+          let fileData = undefined;
+          let audioData = undefined;
+          let expiresInVal = undefined;
+          try {
+            const parsed = JSON.parse(txt);
+            if (parsed) {
+              if (parsed.id) {
+                messageId = parsed.id;
+              }
+              decryptedText = parsed.text || '';
+              replyToData = parsed.replyTo;
+              stickerIdData = parsed.stickerId;
+              fileData = parsed.file;
+              audioData = parsed.audio;
+              expiresInVal = parsed.expiresIn;
+            }
+          } catch {
+            // Legacy plain text message
+          }
+
+          // If attachments/voice are disabled, drop them silently
+          if (!ENABLE_ATTACHMENTS) fileData = undefined;
+          if (!ENABLE_VOICE) audioData = undefined;
+
+          setMessages(p => {
+            const updated = [...p, {
+              id: messageId,
+              text: decryptedText,
+              isMine: false,
+              timestamp: d.timestamp,
+              senderName: d.senderName,
+              replyTo: replyToData,
+              stickerId: stickerIdData,
+              file: fileData,
+              audio: audioData,
+              expiresIn: expiresInVal
+            }];
+            sessionStorage.setItem('ddy_chat_messages', JSON.stringify(updated));
+            return updated;
+          });
+
+          setPeerTyping(false);
+          if (peerTypingTimeoutRef.current) {
+            clearTimeout(peerTypingTimeoutRef.current);
+          }
+
+          playQuack();
+
+          if (document.hidden && Notification.permission === 'granted') {
+            try {
+              let notifBody = decryptedText;
+              if (fileData) notifBody = `📁 sent a file: ${fileData.name}`;
+              else if (audioData) notifBody = `🎤 sent a voice note (${fmtDuration(audioData.duration)})`;
+              else if (stickerIdData) notifBody = `🦆 sent a duck sticker`;
+
+              new Notification(`🦆 Duck Duck Yellow`, {
+                body: `${d.senderName}: ${notifBody}`,
+                icon: logoImg
+              });
+            } catch (e) {
+              console.error('Failed to show notification:', e);
+            }
+          }
+
+          if (isWindowFocused.current) {
+            postMessage({
+              type: 'read',
+              senderDuckId: me.duckId,
+              senderName: me.username,
+              payload: messageId,
+              timestamp: Date.now()
+            });
+          } else {
+            unreadMessagesRef.current.push(messageId);
+          }
+        } catch (e) {
+          console.error('Decryption failed:', e);
+        }
+      }
+
+      if (d.type === 'reaction' && d.payload) {
+        try {
+          const txt = await decryptMessage(d.payload, secretRef.current);
+          const react = JSON.parse(txt) as { messageId: string, emoji: string, senderDuckId: string, senderName: string };
+          if (react && react.messageId && react.emoji) {
+            setMessages(p => {
+              const updated = p.map(m => {
+                if (m.id === react.messageId) {
+                  const existingReactions = m.reactions || [];
+                  const foundIndex = existingReactions.findIndex(
+                    r => r.senderDuckId === react.senderDuckId && r.emoji === react.emoji
+                  );
+
+                  let newReactions = [...existingReactions];
+                  if (foundIndex > -1) {
+                    newReactions.splice(foundIndex, 1);
+                  } else {
+                    newReactions.push({
+                      senderDuckId: react.senderDuckId,
+                      senderName: react.senderName,
+                      emoji: react.emoji
+                    });
+                  }
+                  return { ...m, reactions: newReactions };
+                }
+                return m;
+              });
+              sessionStorage.setItem('ddy_chat_messages', JSON.stringify(updated));
+              return updated;
+            });
+          }
+        } catch (e) {
+          console.error('Failed to handle reaction event:', e);
+        }
+      }
+
+      if (d.type === 'read' && d.payload) {
+        const readMsgId = d.payload;
+        setMessages(prev => {
+          const updated = prev.map(m => {
+            if (m.isMine && (m.id === readMsgId || m.timestamp <= d.timestamp)) {
+              return { ...m, read: true };
+            }
+            return m;
+          });
+          sessionStorage.setItem('ddy_chat_messages', JSON.stringify(updated));
+          return updated;
+        });
+      }
+
+      if (d.type === 'typing') {
+        const isTyping = d.payload === 'true';
+        setPeerTyping(isTyping);
+        if (peerTypingTimeoutRef.current) {
+          clearTimeout(peerTypingTimeoutRef.current);
+        }
+        if (isTyping) {
+          peerTypingTimeoutRef.current = setTimeout(() => {
+            setPeerTyping(false);
+          }, 5000);
+        }
+      }
+
+      if (d.type === 'leave') {
+        setPeerOnline(false);
+        currentPeerOnline = false;
+        setPeerName('');
+        setPeerTyping(false);
+        if (peerTypingTimeoutRef.current) {
+          clearTimeout(peerTypingTimeoutRef.current);
+        }
+      }
+    };
+
     es.onmessage = async (ev: MessageEvent) => {
       try {
         const ntfyData = JSON.parse(ev.data);
@@ -663,205 +935,24 @@ export default function App() {
         }
 
         const d = JSON.parse(ntfyData.message) as BCEvent;
-        const me = userRef.current;
-        if (!me || d.senderDuckId === me.duckId) {
-          return; // Ignore messages from ourselves
-        }
+        if (d.type === 'chunk' && d.chunkId && typeof d.chunkIndex === 'number' && typeof d.chunkTotal === 'number' && d.chunkPart != null) {
+          const existing = chunkBuffers.get(d.chunkId) || Array.from({ length: d.chunkTotal }, () => '');
+          existing[d.chunkIndex] = d.chunkPart;
+          chunkBuffers.set(d.chunkId, existing);
 
-        // Symmetrical/Self-healing peer connection:
-        // If we receive ANY event from the peer, they are online!
-        if (!currentPeerOnline) {
-          setPeerOnline(true);
-          currentPeerOnline = true;
-          setPeerName(d.senderName);
-          setPeerDuckId(d.senderDuckId);
-          setShowCodeBanner(false);
-
-          // Symmetrical salt exchange: re-send our salt to the newly online peer
-          sendSalt(secret);
-
-          // We always send a join event when first connecting, whether they sent a join or any other event,
-          // so that the peer also sets their peerOnline to true.
-          postMessage({ type: 'join', senderDuckId: me.duckId, senderName: me.username, timestamp: Date.now() } satisfies BCEvent);
-        }
-
-        if (d.type === 'salt' && d.payload) {
-          try {
-            // Decrypt salt using base secret
-            const decryptedSalt = await decryptMessage(d.payload, secret);
-            setPeerSalt(decryptedSalt);
-
-            // Sort salts lexicographically to ensure identical key derivation order on both sides
-            const salts = [localSalt, decryptedSalt].sort();
-            const derivedKey = await derivePfsKey(secret, salts[0], salts[1]);
-
-            // Swap session key
-            secretRef.current = derivedKey;
-            setPfsActive(true);
-
-            // Generate verified fingerprint
-            const fp = await generateKeyFingerprint(derivedKey);
-            setFingerprint(fp);
-          } catch (e) {
-            console.error('PFS derivation failed:', e);
-          }
-        }
-
-        if (d.type === 'message' && d.payload) {
-          try {
-            const txt = await decryptMessage(d.payload, secretRef.current);
-            let messageId = genId(); // Default fallback
-            let decryptedText = txt;
-            let replyToData = undefined;
-            let stickerIdData = undefined;
-            let fileData = undefined;
-            let audioData = undefined;
-            let expiresInVal = undefined;
+          if (existing.every(part => part.length > 0)) {
+            chunkBuffers.delete(d.chunkId);
             try {
-              const parsed = JSON.parse(txt);
-              if (parsed) {
-                if (parsed.id) {
-                  messageId = parsed.id;
-                }
-                decryptedText = parsed.text || '';
-                replyToData = parsed.replyTo;
-                stickerIdData = parsed.stickerId;
-                fileData = parsed.file;
-                audioData = parsed.audio;
-                expiresInVal = parsed.expiresIn;
-              }
-            } catch {
-              // Legacy plain text message
+              const mergedEvent = JSON.parse(existing.join('')) as BCEvent;
+              await handleIncomingEvent(mergedEvent);
+            } catch (mergeErr) {
+              console.error('Failed to reassemble chunked relay event:', mergeErr);
             }
-
-            setMessages(p => {
-              const updated = [...p, {
-                id: messageId,
-                text: decryptedText,
-                isMine: false,
-                timestamp: d.timestamp,
-                senderName: d.senderName,
-                replyTo: replyToData,
-                stickerId: stickerIdData,
-                file: fileData,
-                audio: audioData,
-                expiresIn: expiresInVal
-              }];
-              sessionStorage.setItem('ddy_chat_messages', JSON.stringify(updated));
-              return updated;
-            });
-            // Clear peer typing state when a message is received
-            setPeerTyping(false);
-            if (peerTypingTimeoutRef.current) {
-              clearTimeout(peerTypingTimeoutRef.current);
-            }
-
-            // Play quack notification sound!
-            playQuack();
-
-            // Background notifications
-            if (document.hidden && Notification.permission === 'granted') {
-              try {
-                let notifBody = decryptedText;
-                if (fileData) notifBody = `📁 sent a file: ${fileData.name}`;
-                else if (audioData) notifBody = `🎤 sent a voice note (${fmtDuration(audioData.duration)})`;
-                else if (stickerIdData) notifBody = `🦆 sent a duck sticker`;
-
-                new Notification(`🦆 Duck Duck Yellow`, {
-                  body: `${d.senderName}: ${notifBody}`,
-                  icon: logoImg
-                });
-              } catch (e) {
-                console.error('Failed to show notification:', e);
-              }
-            }
-
-            // Send read receipt if window is focused, else queue it
-            if (isWindowFocused.current) {
-              postMessage({
-                type: 'read',
-                senderDuckId: me.duckId,
-                senderName: me.username,
-                payload: messageId,
-                timestamp: Date.now()
-              });
-            } else {
-              unreadMessagesRef.current.push(messageId);
-            }
-          } catch (e) {
-            console.error('Decryption failed:', e);
           }
+          return;
         }
-        if (d.type === 'reaction' && d.payload) {
-          try {
-            const txt = await decryptMessage(d.payload, secretRef.current);
-            const react = JSON.parse(txt) as { messageId: string, emoji: string, senderDuckId: string, senderName: string };
-            if (react && react.messageId && react.emoji) {
-              setMessages(p => {
-                const updated = p.map(m => {
-                  if (m.id === react.messageId) {
-                    const existingReactions = m.reactions || [];
-                    const foundIndex = existingReactions.findIndex(
-                      r => r.senderDuckId === react.senderDuckId && r.emoji === react.emoji
-                    );
-                    
-                    let newReactions = [...existingReactions];
-                    if (foundIndex > -1) {
-                      newReactions.splice(foundIndex, 1);
-                    } else {
-                      newReactions.push({
-                        senderDuckId: react.senderDuckId,
-                        senderName: react.senderName,
-                        emoji: react.emoji
-                      });
-                    }
-                    return { ...m, reactions: newReactions };
-                  }
-                  return m;
-                });
-                sessionStorage.setItem('ddy_chat_messages', JSON.stringify(updated));
-                return updated;
-              });
-            }
-          } catch (e) {
-            console.error('Failed to handle reaction event:', e);
-          }
-        }
-        if (d.type === 'read' && d.payload) {
-          const readMsgId = d.payload;
-          setMessages(prev => {
-            const updated = prev.map(m => {
-              if (m.isMine && (m.id === readMsgId || m.timestamp <= d.timestamp)) {
-                return { ...m, read: true };
-              }
-              return m;
-            });
-            sessionStorage.setItem('ddy_chat_messages', JSON.stringify(updated));
-            return updated;
-          });
-        }
-        if (d.type === 'typing') {
-          const isTyping = d.payload === 'true';
-          setPeerTyping(isTyping);
-          if (peerTypingTimeoutRef.current) {
-            clearTimeout(peerTypingTimeoutRef.current);
-          }
-          if (isTyping) {
-            // Failsafe timeout to automatically clear the indicator after 5 seconds
-            peerTypingTimeoutRef.current = setTimeout(() => {
-              setPeerTyping(false);
-            }, 5000);
-          }
-        }
-        if (d.type === 'leave') {
-          setPeerOnline(false);
-          currentPeerOnline = false;
-          setPeerName('');
-          setPeerTyping(false);
-          if (peerTypingTimeoutRef.current) {
-            clearTimeout(peerTypingTimeoutRef.current);
-          }
-        }
+
+        await handleIncomingEvent(d);
       } catch (err) {
         console.error('Error handling ntfy event:', err);
       }
@@ -1037,6 +1128,7 @@ export default function App() {
   }, [chatInput, replyingTo, ephemeralTimer]);
 
   const sendFileMessage = useCallback(async (file: File) => {
+    if (!ENABLE_ATTACHMENTS) return;
     const channel = channelRef.current;
     const u = userRef.current;
     if (!channel || !u || !peerOnline) return;
@@ -1117,6 +1209,7 @@ export default function App() {
   }, [peerOnline, replyingTo, ephemeralTimer]);
 
   const sendAudioMessage = async (base64Data: string, duration: number) => {
+    if (!ENABLE_VOICE) return;
     if (!channelRef.current || !userRef.current || !peerOnline) return;
 
     const replyToData = replyingTo ? {
@@ -1191,7 +1284,9 @@ export default function App() {
         reader.onloadend = async () => {
           try {
             const base64Data = reader.result as string;
-            await sendAudioMessage(base64Data, recordingDuration);
+            if (ENABLE_VOICE) {
+              await sendAudioMessage(base64Data, recordingDuration);
+            }
           } catch (e) {
             console.error("Failed to send audio:", e);
           }
@@ -1276,6 +1371,7 @@ export default function App() {
   const handleCreateChat = () => {
     const { code, roomId, secret } = generateYellowCode();
     setYellowCode(code);
+    setInviteLink(buildInviteLink(code));
     setCopiedCode(false);
     joinRoom(roomId, secret, true);
   };
@@ -1291,7 +1387,28 @@ export default function App() {
 
   // ---- Init session & restore active chat ----
   useEffect(() => {
+    const inviteCode = readInviteCodeFromLocation();
     const s = getSession();
+    if (inviteCode) {
+      const parsedInvite = parseYellowCode(inviteCode);
+      if (parsedInvite) {
+        setPendingInvite(parsedInvite);
+        setYellowCode(inviteCode);
+        setInviteLink(buildInviteLink(inviteCode));
+        clearInviteFromLocation();
+
+        if (!s) {
+          const guest = createGuestUser();
+          saveSession(guest);
+          setUser(guest);
+        } else {
+          setUser(s);
+        }
+        setView('dashboard');
+        return;
+      }
+    }
+
     if (s) {
       setUser(s);
       
@@ -1308,6 +1425,12 @@ export default function App() {
       setView('dashboard');
     }
   }, [joinRoom]);
+
+  useEffect(() => {
+    if (!user || !pendingInvite) return;
+    joinRoom(pendingInvite.roomId, pendingInvite.secret, false);
+    setPendingInvite(null);
+  }, [user, pendingInvite, joinRoom]);
 
   // ---- Load/Save Local Contacts ----
   useEffect(() => {
@@ -2075,9 +2198,23 @@ export default function App() {
                       )}
                     </button>
                   </div>
+                  {inviteLink && (
+                    <div className="mt-2 flex items-center gap-2">
+                      <code className="flex-1 px-3 py-2 rounded-lg bg-black/20 border border-emerald-500/10 text-[10px] text-emerald-300/80 font-mono truncate select-all">
+                        {inviteLink}
+                      </code>
+                      <button
+                        onClick={() => copyText(inviteLink)}
+                        className="shrink-0 px-3 py-2 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 bg-emerald-500/10 text-emerald-300 border border-emerald-500/15 hover:bg-emerald-500/20"
+                      >
+                        <span className="material-symbols-rounded text-sm">link</span>
+                        Copy Link
+                      </button>
+                    </div>
+                  )}
                   <p className="text-[10px] text-gray-600 mt-1.5 flex items-center gap-1">
                     <span className="material-symbols-rounded text-[11px]">info</span>
-                    Send via paper, different app, or say it in person — anything untracked
+                    Send via paper, a different app, or the shareable link from any device
                   </p>
                 </div>
               </div>
@@ -2218,7 +2355,7 @@ export default function App() {
                   )}
 
                   {/* Encrypted Decrypted File - Images */}
-                  {msg.file && msg.file.type.startsWith('image/') && (
+                  {ENABLE_ATTACHMENTS && msg.file && msg.file.type.startsWith('image/') && (
                     <div className="relative rounded-xl overflow-hidden border border-amber-500/10 max-w-full my-1.5 bg-black/25 select-none">
                       <img
                         src={msg.file.data}
@@ -2233,7 +2370,7 @@ export default function App() {
                   )}
 
                   {/* Encrypted Decrypted File - Other files */}
-                  {msg.file && !msg.file.type.startsWith('image/') && (
+                  {ENABLE_ATTACHMENTS && msg.file && !msg.file.type.startsWith('image/') && (
                     <div className="flex items-center gap-3 p-2.5 bg-black/45 border border-amber-500/10 rounded-xl my-1.5 max-w-xs select-none">
                       <div className="w-10 h-10 rounded-xl bg-amber-500/10 flex items-center justify-center text-amber-400 shrink-0">
                         <span className="material-symbols-rounded text-xl">description</span>
@@ -2254,7 +2391,7 @@ export default function App() {
                   )}
 
                   {/* Encrypted Decrypted Audio Voice Notes */}
-                  {msg.audio && (
+                  {ENABLE_VOICE && msg.audio && (
                     <VoicePlayer data={msg.audio.data} duration={msg.audio.duration} />
                   )}
 
@@ -2466,16 +2603,18 @@ export default function App() {
                 </button>
 
                 {/* 2. File attachment option */}
-                <button
-                  onClick={() => {
-                    fileInputRef.current?.click();
-                    setShowActionsMenu(false);
-                  }}
-                  className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-amber-500/10 text-gray-300 hover:text-amber-400 transition-all text-left"
-                >
-                  <span className="material-symbols-rounded text-lg shrink-0">attach_file</span>
-                  <span className="text-xs font-semibold">Share File</span>
-                </button>
+                {ENABLE_ATTACHMENTS && (
+                  <button
+                    onClick={() => {
+                      fileInputRef.current?.click();
+                      setShowActionsMenu(false);
+                    }}
+                    className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-amber-500/10 text-gray-300 hover:text-amber-400 transition-all text-left"
+                  >
+                    <span className="material-symbols-rounded text-lg shrink-0">attach_file</span>
+                    <span className="text-xs font-semibold">Share File</span>
+                  </button>
+                )}
 
                 {/* 3. Ephemeral self-destruct timer option */}
                 <button
@@ -2544,18 +2683,20 @@ export default function App() {
             )}
 
             <div className="py-3 flex gap-2 items-center">
-              <input
-                type="file"
-                ref={fileInputRef}
-                onChange={e => {
-                  const file = e.target.files?.[0];
-                  if (file) {
-                    sendFileMessage(file);
-                    e.target.value = '';
-                  }
-                }}
-                className="hidden"
-              />
+              {ENABLE_ATTACHMENTS && (
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  onChange={e => {
+                    const file = e.target.files?.[0];
+                    if (file) {
+                      sendFileMessage(file);
+                      e.target.value = '';
+                    }
+                  }}
+                  className="hidden"
+                />
+              )}
 
               {/* Actions Toggle Trigger Button */}
               <button
@@ -2628,7 +2769,7 @@ export default function App() {
                     </button>
                   )}
 
-                  {!chatInput.trim() && peerOnline ? (
+                  {!chatInput.trim() && peerOnline && ENABLE_VOICE ? (
                     <button
                       onClick={startRecording}
                       className="w-11 h-11 rounded-xl bg-gray-800 border border-gray-700 text-gray-400 hover:text-amber-400 hover:bg-gray-700/60 flex items-center justify-center shrink-0 transition-all active:scale-95"
