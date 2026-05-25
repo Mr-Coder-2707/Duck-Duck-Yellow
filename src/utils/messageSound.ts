@@ -18,7 +18,7 @@ export const playMessageNotificationSound = async () => {
  * Play message sound from external audio file
  * Returns true if successful, false if failed
  */
-export const playMessageSoundFromFile = async (soundPath: string = '/src/sound/message-notification.wav'): Promise<boolean> => {
+export const playMessageSoundFromFile = async (soundPath: string = '/src/sound/duckquack.wav'): Promise<boolean> => {
   return new Promise((resolve) => {
     try {
       const audio = new Audio(soundPath);
