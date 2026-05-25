@@ -6,7 +6,7 @@
 // Try to use real audio file first, fallback to synthesized sound
 export const playMessageNotificationSound = async () => {
   // First try to play the real WAV file
-  const success = await playMessageSoundFromFile('/src/sound/duckquack.wav');
+  const success = await playMessageSoundFromFile('/sound/duckquack.wav');
   
   // If file fails to load or play, fallback to synthesized sound
   if (!success) {
@@ -18,7 +18,7 @@ export const playMessageNotificationSound = async () => {
  * Play message sound from external audio file
  * Returns true if successful, false if failed
  */
-export const playMessageSoundFromFile = async (soundPath: string = '/src/sound/duckquack.wav'): Promise<boolean> => {
+export const playMessageSoundFromFile = async (soundPath: string = '/sound/duckquack.wav'): Promise<boolean> => {
   return new Promise((resolve) => {
     try {
       const audio = new Audio(soundPath);
