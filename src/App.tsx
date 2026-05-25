@@ -9,6 +9,7 @@ import {
   generateKeyFingerprint,
   derivePfsKey,
 } from './utils/crypto';
+import { playMessageNotificationSound } from './utils/messageSound';
 import logoImg from './image/logo.png';
 
 // ======================== TYPES ========================
@@ -819,7 +820,8 @@ export default function App() {
             clearTimeout(peerTypingTimeoutRef.current);
           }
 
-          playQuack();
+          // Play message notification sound (like WhatsApp)
+          playMessageNotificationSound();
 
           if (document.hidden && Notification.permission === 'granted') {
             try {
